@@ -1,0 +1,10 @@
+OPENAI_API_KEY=api_key
+MAX_CALL_DURATION=300000          # Max call duration in ms (default: 5 min)
+RTP_QUEUE_CONCURRENCY=50          # Number of concurrent RTP packet sends
+LOG_RTP_EVERY_N_PACKETS=100       # Log RTP stats every N packets
+ENABLE_RTP_LOGGING=false          # Enable detailed RTP packet logging
+ENABLE_SENT_TO_OPENAI_RECORDING=false  # Save .raw (Asterisk input) and .wav (OpenAI audio) files
+VAD_THRESHOLD=0.8                 # Voice detection threshold (0-1)
+VAD_PREFIX_PADDING_MS=300         # Prefix padding for VAD in ms
+VAD_SILENCE_DURATION_MS=700       # Silence duration for VAD in ms
+AUDIO_GAIN=1.5                    # Audio gain (currently unused)
