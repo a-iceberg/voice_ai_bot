@@ -1,0 +1,23 @@
+{
+  "name": "asterisk-to-openai-rt",
+  "version": "1.0.0",
+  "description": "Asterisk Integration with OpenAI Real Time 0.1",
+  "main": "asterisk_to_openai_rt.js",
+  "scripts": {
+    "start": "node asterisk_to_openai_rt.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Stepan",
+  "license": "MIT",
+  "dependencies": {
+    "ari-client": "^2.2.0",
+    "ws": "^8.18.0",
+    "winston": "^3.14.2",
+    "chalk": "^4.1.2",
+    "async": "^3.2.6",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
