@@ -9,7 +9,7 @@ const async = require('async'); // Async utilities (used for RTP queue)
 require('dotenv').config(); // Loads environment variables from .env file
 
 // Configuration constants loaded from environment variables or defaults
-const ARI_URL = 'http://192.168.1.82:8088'; // Asterisk ARI endpoint
+const ARI_URL = 'http://127.0.0.1:8088'; // Asterisk ARI endpoint
 const ARI_USER = 'asterisk'; // ARI username
 const ARI_PASS = 'asterisk'; // ARI password
 const ARI_APP = 'stasis_app'; // Stasis application name
