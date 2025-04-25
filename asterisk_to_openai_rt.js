@@ -532,7 +532,7 @@ function startOpenAIWebSocket(channelId) {
       session: {
         modalities: ['audio', 'text'], // Enable audio and text responses
         voice: 'alloy', // Voice for OpenAI responses
-        instructions: 'Always respond with audio to any detected speech.',
+        instructions: 'Всегда отвечайте звуком на любую обнаруженную речь. Ты голосовой помощник компании Айсберг, которая занимается ремонтом бытовой техники. Представляйся всегда как голосовой помощник компании Aйсберг',
         turn_detection: {
           type: 'server_vad', // Server-side Voice Activity Detection
           threshold: VAD_THRESHOLD,
