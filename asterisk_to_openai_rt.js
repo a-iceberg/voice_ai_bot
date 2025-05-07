@@ -550,7 +550,7 @@ function startOpenAIWebSocket(channelId) {
          }, // Модель транскрипции
         "input_audio_noise_reduction" : {type: 'near_field'},
         "temperature": 0.6,
-        "max_response_output_tokens": 400,
+        "max_response_output_tokens": 500,
       }
     }));
     logClient(`Session updated with VAD settings for channel ${channelId} | Threshold: ${VAD_THRESHOLD}, Prefix: ${VAD_PREFIX_PADDING_MS}ms, Silence: ${VAD_SILENCE_DURATION_MS}ms`);
