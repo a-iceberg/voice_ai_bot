@@ -1,31 +1,36 @@
-// Import required Node.js modules
-const ari = require('ari-client'); // Asterisk REST Interface client
-const WebSocket = require('ws'); // WebSocket library for OpenAI real-time API
-const fs = require('fs'); // File system module for saving audio files
-const dgram = require('dgram'); // UDP datagram for RTP audio streaming
-const winston = require('winston'); // Logging library
-const chalk = require('chalk'); // Colorizes console output
-const async = require('async'); // Async utilities (used for RTP queue)
-require('dotenv').config(); // Loads environment variables from .env file
+// Импорт необходимых модулей Node.js
+const ari = require('ari-client'); // Клиент Asterisk REST Interface (ARI)
+const WebSocket = require('ws'); // Библиотека WebSocket для OpenAI real-time API
+const fs = require('fs'); // Работа с файловой системой (для сохранения аудио)
+const dgram = require('dgram'); // Работа с UDP (для RTP аудио)
+const winston = require('winston'); // Логирование
+const chalk = require('chalk'); // Цветной вывод в консоль
+const async = require('async'); // Асинхронные утилиты (используются для очереди RTP)
+require('dotenv').config(); // Загружает переменные из файла .env
 
-// Configuration constants loaded from environment variables or defaults
-const ARI_URL = 'http://127.0.0.1:8088'; // Asterisk ARI endpoint
-const ARI_USER = 'asterisk'; // ARI username
-const ARI_PASS = 'asterisk'; // ARI password
-const ARI_APP = 'stasis_app'; // Stasis application name
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // OpenAI API key from .env
-const REALTIME_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17'; // OpenAI real-time WebSocket URL
-const RTP_PORT = 12000; // Local port for RTP audio reception
-const MAX_CALL_DURATION = process.env.MAX_CALL_DURATION ? parseInt(process.env.MAX_CALL_DURATION) : 300000; // Max call duration in ms (default: 5 min)
-const RTP_QUEUE_CONCURRENCY = parseInt(process.env.RTP_QUEUE_CONCURRENCY) || 50; // Concurrent RTP packet sends
-const LOG_RTP_EVERY_N_PACKETS = parseInt(process.env.LOG_RTP_EVERY_N_PACKETS) || 100; // Log RTP stats every N packets
-const ENABLE_RTP_LOGGING = process.env.ENABLE_RTP_LOGGING === 'true'; // Enable detailed RTP logging
-const ENABLE_SENT_TO_OPENAI_RECORDING = process.env.ENABLE_SENT_TO_OPENAI_RECORDING === 'true'; // Controls saving of both .raw and .wav files
-const VAD_THRESHOLD = process.env.VAD_THRESHOLD ? parseFloat(process.env.VAD_THRESHOLD) : 0.1; // Voice Activity Detection threshold
-const VAD_PREFIX_PADDING_MS = process.env.VAD_PREFIX_PADDING_MS ? parseInt(process.env.VAD_PREFIX_PADDING_MS) : 300; // VAD prefix padding in ms
-const VAD_SILENCE_DURATION_MS = process.env.VAD_SILENCE_DURATION_MS ? parseInt(process.env.VAD_SILENCE_DURATION_MS) : 500; // VAD silence duration in ms
-const TARGET_RMS = 0.15; // Target Root Mean Square for audio normalization
-const MIN_RMS = 0.001; // Minimum RMS to apply gain
+// Константы конфигурации, загружаемые из переменных среды или берутся по умолчанию
+const ARI_URL = 'http://127.0.0.1:8088'; // Адрес ARI (Asterisk REST Interface)
+const ARI_USER = 'asterisk'; // Имя пользователя ARI
+const ARI_PASS = 'asterisk'; // Пароль ARI
+const ARI_APP = 'stasis_app'; // Имя приложения Stasis
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // Ключ OpenAI из .env
+const REALTIME_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17'; // WebSocket URL модели GPT-4o real-time
+
+const RTP_PORT = 12000; // Локальный порт для приёма RTP аудио
+
+const MAX_CALL_DURATION = process.env.MAX_CALL_DURATION ? parseInt(process.env.MAX_CALL_DURATION) : 300000; // Макс. продолжительность звонка в мс (по умолчанию 5 минут)
+const RTP_QUEUE_CONCURRENCY = parseInt(process.env.RTP_QUEUE_CONCURRENCY) || 50; // Кол-во одновременных отправок RTP-пакетов
+const LOG_RTP_EVERY_N_PACKETS = parseInt(process.env.LOG_RTP_EVERY_N_PACKETS) || 100; // Логировать RTP-статистику каждые N пакетов
+const ENABLE_RTP_LOGGING = process.env.ENABLE_RTP_LOGGING === 'true'; // Включить детальное логирование RTP
+const ENABLE_SENT_TO_OPENAI_RECORDING = process.env.ENABLE_SENT_TO_OPENAI_RECORDING === 'true'; // Сохранять аудио, отправленное в OpenAI (.raw и .wav)
+
+const VAD_THRESHOLD = process.env.VAD_THRESHOLD ? parseFloat(process.env.VAD_THRESHOLD) : 0.1; // Порог VAD (чувствительность детекции речи)
+const VAD_PREFIX_PADDING_MS = process.env.VAD_PREFIX_PADDING_MS ? parseInt(process.env.VAD_PREFIX_PADDING_MS) : 300; // Префиксный отступ VAD в мс (добавляется перед обнаруженной речью)
+const VAD_SILENCE_DURATION_MS = process.env.VAD_SILENCE_DURATION_MS ? parseInt(process.env.VAD_SILENCE_DURATION_MS) : 500; // Время тишины VAD в мс (после которого речь считается законченной)
+
+const TARGET_RMS = 0.15; // Целевое значение RMS для нормализации громкости аудио
+const MIN_RMS = 0.001; // Минимальное RMS для применения усиления аудио
 
 // Counters for client/server event logging
 let sentEventCounter = 0; // Tracks sent events to OpenAI
