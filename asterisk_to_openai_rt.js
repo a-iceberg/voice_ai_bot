@@ -532,14 +532,20 @@ function startOpenAIWebSocket(channelId) {
       session: {
         modalities: ['audio', 'text'], // Enable audio and text responses
         voice: 'alloy', // Voice for OpenAI responses
-        instructions: 'Всегда отвечайте звуком на любую обнаруженную речь. Ты голосовой помощник компании Айсберг, которая занимается ремонтом бытовой техники. Представляйся всегда как голосовой помощник компании Aйсберг',
+        instructions: 'Всегда отвечайте звуком на любую обнаруженную речь. Ты голосовой помощник компании Айсберг, которая занимается ремонтом бытовой техники.',
         turn_detection: {
           type: 'server_vad', // Server-side Voice Activity Detection
           threshold: VAD_THRESHOLD,
           prefix_padding_ms: VAD_PREFIX_PADDING_MS,
-          silence_duration_ms: VAD_SILENCE_DURATION_MS
+          silence_duration_ms: VAD_SILENCE_DURATION_MS,
+          create_response: true
         },
-        input_audio_transcription: { model: 'whisper-1' } // Transcription model
+        input_audio_transcription: { model: 'whisper-1',
+          language: 'ru'
+         }, // Transcription model
+        "input_audio_noise_reduction" : near_field,
+        "temperature": 0.6,
+        "max_response_output_tokens": 200,
       }
     }));
     logClient(`Session updated with VAD settings for channel ${channelId} | Threshold: ${VAD_THRESHOLD}, Prefix: ${VAD_PREFIX_PADDING_MS}ms, Silence: ${VAD_SILENCE_DURATION_MS}ms`);
