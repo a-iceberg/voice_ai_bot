@@ -545,12 +545,12 @@ function startOpenAIWebSocket(channelId) {
           silence_duration_ms: VAD_SILENCE_DURATION_MS,
           create_response: true
         },
-        input_audio_transcription: { model: 'whisper-1',
+        input_audio_transcription: { model: 'whisper-1', 
           language: 'ru'
-         }, // Модель транскрипции
-        "input_audio_noise_reduction" : {type: 'near_field'},
-        "temperature": 0.6,
-        "max_response_output_tokens": 500,
+         }, // Модель для транскрипции речи в текст
+        "input_audio_noise_reduction" : {type: 'near_field'},  // Снижение шумов в ауди
+        "temperature": 0.6, // Температура (креативность) модели
+        "max_response_output_tokens": 500, // Максимальное количество токенов (слов) в ответе
       }
     }));
     logClient(`Session updated with VAD settings for channel ${channelId} | Threshold: ${VAD_THRESHOLD}, Prefix: ${VAD_PREFIX_PADDING_MS}ms, Silence: ${VAD_SILENCE_DURATION_MS}ms`);
