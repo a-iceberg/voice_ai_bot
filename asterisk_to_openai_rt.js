@@ -1,5 +1,5 @@
 // Импорт необходимых модулей Node.js
-const ari = require('ari-client'); // Клиент Asterisk REST Interface (ARI)
+const ari = require('ari-client'); // Клиент Asterisk REST Interface (ARI
 const WebSocket = require('ws'); // Библиотека WebSocket для OpenAI real-time API
 const fs = require('fs'); // Работа с файловой системой (для сохранения аудио)
 const dgram = require('dgram'); // Работа с UDP (для RTP аудио)
