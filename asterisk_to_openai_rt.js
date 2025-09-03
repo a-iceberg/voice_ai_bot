@@ -1,11 +1,14 @@
+debugger;
 // Импорт необходимых модулей Node.js
-const ari = require('ari-client'); // Клиент Asterisk REST Interface (ARI
+const ari = require('ari-client'); // Клиент Asterisk REST Interface (ARI)
 const WebSocket = require('ws'); // Библиотека WebSocket для OpenAI real-time API
 const fs = require('fs'); // Работа с файловой системой (для сохранения аудио)
 const dgram = require('dgram'); // Работа с UDP (для RTP аудио)
 const winston = require('winston'); // Логирование
 const chalk = require('chalk'); // Цветной вывод в консоль
 const async = require('async'); // Асинхронные утилиты (используются для очереди RTP)
+const path = require('path');
+const { parsePhoneNumberFromString } = require('libphonenumber-js');
 require('dotenv').config(); // Загружает переменные из файла .env
 
 // Константы конфигурации, загружаемые из переменных среды или берутся по умолчанию
@@ -15,7 +18,7 @@ const ARI_PASS = 'asterisk'; // Пароль ARI
 const ARI_APP = 'stasis_app'; // Имя приложения Stasis
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // Ключ OpenAI из .env
-const REALTIME_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17'; // WebSocket URL модели GPT-4o real-time
+const REALTIME_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2025-06-03'; // WebSocket URL модели GPT-4o real-time
 
 const RTP_PORT = 12000; // Локальный порт для приёма RTP аудио
 
@@ -79,6 +82,185 @@ const audioToOpenAIMap = new Map(); // Buffers audio sent to OpenAI
 const amplificationLogFrequency = new Map(); // Tracks last amplification log time per channel
 const rmsLogFrequency = new Map(); // Tracks last RMS log time per channel
 const rtpSentStats = new Map(); // Tracks RTP stats per channel
+
+// Асинхронная обработка вызова функции validateRussianPhone
+function validateRussianPhone(raw) {
+  // убираем пробелы, дефисы и скобки, если вдруг появились
+  const cleaned = String(raw).replace(/[^\d+]/g, '');
+  try {
+    const pn = parsePhoneNumberFromString(cleaned, 'RU');
+    // валидный ли номер и точно ли он российский
+    if (pn?.isValid() && pn.country === 'RU') {
+      return pn.number;            // вернёт строку формата +7XXXXXXXXXX
+    }
+  } catch (_) { /* ignore */ }
+  return null;                      // невалидный
+}
+
+async function handleValidatePhone(call, ws, logger) {
+  if (!call.arguments) {
+    logger.error('validate_phone: arguments missing');
+    return;
+  }
+
+  let args;
+  try {
+    args = typeof call.arguments === 'string'
+      ? JSON.parse(call.arguments)
+      : call.arguments;
+  } catch (e) {
+    logger.error('validate_phone: bad JSON:', e);
+    return;
+  }
+
+  const phone = String(args.phone);
+  logger.info(`🔍 [PHONE] Валидация телефона через tools: "${phone}"`);
+
+  const formattedPhone = validateRussianPhone(phone);
+
+  if (!formattedPhone) {
+    logger.warn(`[PHONE] Некорректный телефон: ${phone}`);
+    if (ws && ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'response.create',
+        response: {
+          modalities: ['audio', 'text'],
+          instructions: `Скажи ровно: "Похоже, номер телефона некорректен. Пожалуйста, повторите номер полностью, начиная с +7."`,
+          temperature: 0.6
+        }
+      }));
+    }
+  } else {
+    logger.info(`[PHONE] Валидный телефон: ${formattedPhone}`);
+    if (ws && ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'response.create',
+        response: {
+          modalities: ['audio', 'text'],
+          instructions: `Скажи ровно: "Я записала номер ${formattedPhone}. Всё верно?`,
+          temperature: 0.6
+        }
+      }));
+    }
+  }
+}
+// Асинхронная обработка вызова функции save_client_info
+const { spawn } = require('child_process');
+
+/**
+ * Запускает save_client_info.py и логирует его вывод.
+ * При наличии строки «✅ Номер новой заявки: <num>» вернёт orderNumber.
+ */
+async function runSaveClientInfo(clientData, logger) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('python3', ['-u', 'save_client_info.py'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    let orderNumber = null;
+
+    proc.stdout.on('data', buf => {
+      buf.toString().split(/\r?\n/).filter(Boolean).forEach(line => {
+        logger.info(`[save_client_info] ${line}`);
+        const m = line.match(/Номер новой заявки:\s*([^\s]+)/);
+        if (m) orderNumber = m[1];
+      });
+    });
+
+    proc.stderr.on('data', buf =>
+      buf.toString().split(/\r?\n/).filter(Boolean)
+        .forEach(line => logger.error(`[save_client_info:stderr] ${line}`))
+    );
+
+    proc.on('close', code => {
+      if (code === 0 && orderNumber) return resolve(orderNumber);
+      const msg = `save_client_info.py exited with code ${code}`;
+      logger.error(msg);
+      reject(new Error(msg));
+    });
+
+    proc.stdin.write(JSON.stringify(clientData));
+    proc.stdin.end();
+  });
+}
+
+
+// --- основной обработчик ----------------------------------------------------
+async function handleSaveClientInfo(call, ws, logger) {
+  /* ---------- 1. parse arguments ----------------------------------------- */
+  if (!call.arguments) return logger.error('save_client_info: arguments missing');
+
+  let args;
+  try {
+    args = typeof call.arguments === 'string'
+      ? JSON.parse(call.arguments)
+      : call.arguments;
+  } catch (e) {
+    return logger.error('save_client_info: bad JSON:', e);
+  }
+
+  /* ---------- 2. build payload for Python -------------------------------- */
+  const channelEntry = Array.from(sipMap.entries()).find(([, data]) => data.ws === ws);
+  const callerNumber = channelEntry ? channelEntry[1].callerNumber : null;
+
+  const clientData = {
+    name:  args.name,
+    direction: args.direction,
+    circumstances: args.circumstances || '',
+    brand: args.brand || '',
+    phone: String(args.phone),
+    phone2: callerNumber || '',
+    address: {
+      city: args.address?.city,
+      street: args.address?.street,
+      house_number: args.address?.house_number,
+      apartment: args.address?.apartment || '',
+      entrance: args.address?.entrance || '',
+      floor: args.address?.floor || '',
+      intercom: args.address?.intercom || '',
+      latitude: args.address?.latitude,
+      longitude: args.address?.longitude
+    },
+    date: args.date || '',
+    comment: args.comment || ''
+  };
+
+  /* ---------- 3. run Python ---------------------------------------------- */
+  let orderNum;
+  try {
+    orderNum = await runSaveClientInfo(clientData, logger); // ← ловит «Пл2251279»
+    logger.info(`Заявка создана, номер ${orderNum}`);
+  } catch (err) {
+    logger.error(`save_client_info: ${err.message}`);
+
+    // вежливо сообщаем об ошибке
+    if (ws?.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'response.create',
+        response: {
+          modalities: ['audio', 'text'],
+          instructions: 'К сожалению, заявку сохранить не удалось. Попробуйте позже.'
+        }
+      }));
+    }
+    return;
+  }
+
+  /* ---------- 4. tell the user the ticket number ------------------------- */
+  if (ws && ws.readyState === ws.OPEN) {
+    const reply = `Ваша заявка сохранена. Номер ${orderNum}. Спасибо за обращение!`;
+
+    ws.send(
+      JSON.stringify({
+        type: 'response.create',
+        response: {
+          modalities: ['audio', 'text'],
+          instructions: `Скажи ровно и обязательно озвучь номер заявки: "${reply}"`, // 🔒 фиксируем формулировку
+          temperature: 0.6
+        }
+      })
+    );
+
+    logger.info(`🔔 [Client] Ответ с номером отправлен в OpenAI: ${orderNum}`);
+  }}
+
 
 // Add an ExternalMedia channel to a bridge with retry logic
 async function addExtToBridge(client, channel, bridgeId, retries = 5, delay = 500) {
@@ -526,8 +708,93 @@ function startOpenAIWebSocket(channelId) {
     }
     return streamHandler;
   };
+// 1. Заранее объявите массив (лучше вверху файла, но можно прямо здесь)
+const tools = [
+  {
+    type: 'function',
+    name: 'save_client_info',
+    description: 'Создаёт заявку клиента в 1С и логирует данные',
+    parameters: {
+      type: 'object',
+      required: ['name', 'direction', 'phone', 'address'],
+      properties: {
+        name:        { type: 'string',  description: 'Имя клиента' },
+        direction:   { type: 'string',  description: 'цель / причина обращения',
+          enum: [
+            'Холодильники',
+            'Кондиционеры',
+            'Телевизоры',
+            'Стиральные машины',
+            'Посудомоечные машины',
+            'Швейные машины',
+            'Кофемашины',
+            'Плиты',
+            'Микроволновки',
+            'Вытяжки',
+            'Компьютеры',
+            'Гаджеты',
+            'Промышленный холод',
+            'Газовые колонки',
+            'Установка',
+            'Пылесосы',
+            'Клининг',
+            'Дезинсекция',
+            'Натяжные потолки',
+            'Мелкобытовой сервис',
+            'Ремонт квартир',
+            'Сантехника',
+            'Вывоз мусора',
+            'Уборка',
+            'Электрика',
+            'Окна'
+          ]
+        },
+        circumstances:{ type: 'string', description: 'Подробности неисправности / обращения' },
+        brand:       { type: 'string',  description: 'Бренд и модель техники одной строкой' },
+        phone: {
+  type: 'string',
+  description: 'Контактный телефон в формате +7XXXXXXXXXX',
+  pattern: '^\\+7\\d{10}$'
+},
+        address: {
+          type: 'object',
+          description: 'Адрес выезда мастера',
+          required: ['city', 'street', 'house_number'],
+          properties: {
+            city:        { type: 'string', description: 'Город' },
+            street:      { type: 'string', description: 'Улица' },
+            house_number:{ type: 'string', description: 'Дом / корпус / строение' },
+            apartment:   { type: 'string', description: 'Квартира' },
+            entrance:    { type: 'string', description: 'Подъезд' },
+            floor:       { type: 'string', description: 'Этаж' },
+            intercom:    { type: 'string', description: 'Код домофона' },
+            latitude:    { type: 'number', description: 'Широта' },
+            longitude:   { type: 'number', description: 'Долгота' }
+          }
+        },
+        date:   { type: 'string', description: 'Желаемая дата визита (YYYY-MM-DD)' },
+        comment:{ type: 'string', description: 'Дополнительный комментарий' }
+      }
+    }
+  },
+    {
+    type: 'function',
+    name: 'validate_phone',
+    description: 'Валидирует и нормализует российский номер телефона.',
+    parameters: {
+      type: 'object',
+      required: ['phone'],
+      properties: {
+        phone: {
+          type: 'string',
+          description: 'Контактный телефон, который произнёс клиент.',
+        }
+      }
+    }
+  }
+];
 
-  // WebSocket open event
+// WebSocket open event
   ws.on('open', async () => {
     callStartTime = Date.now();
     logClient(`OpenAI WebSocket connection established for channel ${channelId}`);
@@ -536,8 +803,27 @@ function startOpenAIWebSocket(channelId) {
       type: 'session.update',
       session: {
         modalities: ['audio', 'text'], // Включить аудио и текстовые ответы
-        voice: 'sage', // Голос для ответов OpenAI
-        instructions: 'Всегда отвечайте звуком на любую обнаруженную речь. Ты голосовой помощник компании Айсберг, которая занимается ремонтом бытовой техники.',
+        voice: 'alloy', // Голос для ответов OpenAI
+        instructions:`Отвечай всегда голосом на любую речь. Ты голосовой ассистент компании Айсберг, которая занимается ремонтом бытовой техники. Твоя основная задача — полностью и корректно принять заявку на ремонт, последовательно собрав у клиента следующие данные:
+1.	Имя клиента — обязательно.
+2.	Цель или причину обращения — уточняй, если клиент не говорит ясно или однозначно.
+3.	Дополнительные подробности неисправности или обращения — попроси клиента описать проблему, если он не дал информации.
+4. Бренд и модель техники — спрашивай, если речь идет о ремонте техники (например, «LG GA-B509CQSL»). Если техника не указана, пропускай этот пункт.
+5. Контактный телефон лица на месте ремонта — обязательно. 
+Попроси продиктовать номер полностью, начиная с +7. 
+После того как клиент продиктует номер, ВСЕГДА вызови функцию validate_phone с указанным номером. 
+Если результат проверки показывает, что номер некорректный — скажи: "Похоже, номер некорректен. Повторите, пожалуйста, номер полностью, начиная с +7". 
+Сделай переспрос только один раз. 
+После второго ответа клиента НЕ вызывай функцию повторно и просто запиши номер так, как он был продиктован, даже если он некорректный. 
+Затем переходи к следующему вопросу.
+6.	Адрес выезда мастера, включающий минимум: город, улицу, номер дома (с корпусом/строением, если есть).
+7.	Дополнительная информация по адресу (квартира, подъезд, этаж, код домофона) — не обязательно, но желательно запросить.
+8. Дата визита мастера — обязательно, если клиент уже упомянул дату. Учитывай, что сейчас 2025 год. 
+9. Комментарий — если клиент хочет оставить какие-то дополнительные комментарии.
+Веди диалог активно и вежливо, задавай недостающие вопросы, если данные не были названы. Не заканчивай разговор, пока не соберёшь все обязательные поля.
+После того как соберёшь все данные, вызови функцию save_client_info с параметрами для сохранения заявки.
+Подтверди клиенту, что заявка принята и сохранена, и при необходимости предложи дополнительную помощь.
+` ,
         turn_detection: {
           type: 'server_vad', // Обнаружение голосовой активности на стороне сервера
           threshold: VAD_THRESHOLD,
@@ -545,12 +831,14 @@ function startOpenAIWebSocket(channelId) {
           silence_duration_ms: VAD_SILENCE_DURATION_MS,
           create_response: true
         },
-        input_audio_transcription: { model: 'whisper-1', 
+        input_audio_transcription: { model: 'whisper-1',
           language: 'ru'
-         }, // Модель для транскрипции речи в текст
-        "input_audio_noise_reduction" : {type: 'near_field'},  // Снижение шумов в ауди
-        "temperature": 0.6, // Температура (креативность) модели
-        "max_response_output_tokens": 500, // Максимальное количество токенов (слов) в ответе
+         }, // Модель транскрипции
+        "input_audio_noise_reduction" : {type: 'near_field'},
+        "temperature": 0.6,
+        //"max_response_output_tokens": 500,
+        tools,
+    tool_choice: 'auto'
       }
     }));
     logClient(`Session updated with VAD settings for channel ${channelId} | Threshold: ${VAD_THRESHOLD}, Prefix: ${VAD_PREFIX_PADDING_MS}ms, Silence: ${VAD_SILENCE_DURATION_MS}ms`);
@@ -571,10 +859,26 @@ function startOpenAIWebSocket(channelId) {
     }, MAX_CALL_DURATION);
   });
 
-  // Handle incoming WebSocket messages from OpenAI
+  
+
   ws.on('message', async (data) => {
-    const response = JSON.parse(data.toString());
-    receivedEventCounter++;
+    try {
+      const response = JSON.parse(data.toString());
+      receivedEventCounter++;
+
+
+      if (response.type === 'response.done') {
+        const outputs = response.response?.output || [];
+        for (const output of outputs) {
+          if (output.type === 'function_call' && output.name === 'save_client_info') {
+            await handleSaveClientInfo(output, ws, logger);
+          }
+          if (output.type === 'function_call' && output.name === 'validate_phone') {
+            await handleValidatePhone(output, ws, logger);
+          }
+        }
+      }
+
     const duration = audioSentTime ? ((Date.now() - audioSentTime) / 1000).toFixed(2) : 'N/A';
 
     if (receivedEventCounter === 0) {
@@ -610,10 +914,10 @@ function startOpenAIWebSocket(channelId) {
           audioReceivedLogged = true;
         }
         isPlayingResponse = true;
-        const pcmChunk = Buffer.from(response.delta, 'base64'); // Decode audio chunk
+        const pcmChunk = Buffer.from(response.delta, 'base64');
         logServer(`Audio delta received for channel ${channelId} | Size: ${(pcmChunk.length / 1024).toFixed(2)} KB`);
         if (streamHandler) {
-          streamHandler.write(pcmChunk); // Send to Asterisk
+          streamHandler.write(pcmChunk);
           totalPacketsSentThisResponse += pcmChunk.length / 160;
           totalPacketsSentSession += pcmChunk.length / 160;
         } else {
@@ -622,7 +926,7 @@ function startOpenAIWebSocket(channelId) {
         break;
       case 'response.audio_transcript.delta':
         transcriptDeltaCount++;
-        responseTranscript += response.delta; // Accumulate transcript
+        responseTranscript += response.delta;
         break;
       case 'response.audio_transcript.done':
         logServer(`Response received for channel ${channelId} | Transcript: "${response.transcript.trim()}" | Duration: ${duration}s | Status: Received`);
@@ -638,7 +942,7 @@ function startOpenAIWebSocket(channelId) {
         transcriptDeltaCount = 0;
         totalPacketsSentThisResponse = 0;
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'input_audio_buffer.clear' })); // Clear OpenAI buffer
+          ws.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           logClient(`Cleared OpenAI audio buffer for channel ${channelId}`);
         }
         break;
@@ -650,7 +954,10 @@ function startOpenAIWebSocket(channelId) {
         }
         break;
     }
-  });
+  } catch (error) {
+    logger.error(`Ошибка в обработчике сообщения: ${error.message}`);
+  }
+});
 
   ws.on('error', (error) => {
     logClient(`OpenAI WebSocket error for channel ${channelId} | Message: ${error.message} | Status: Error`);
@@ -685,6 +992,9 @@ function startOpenAIWebSocket(channelId) {
     // Handle new channel entering Stasis
     ariClient.on('StasisStart', async (evt, channel) => {
       logger.info(`StasisStart event received for channel ${channel.id}, name: ${channel.name}`);
+      const callerNumber = channel.caller && channel.caller.number ? channel.caller.number : null;
+      logger.info(`🔔 [PHONE] Caller number (phone2): ${callerNumber}`);
+      // logger.info(JSON.stringify(channel, null, 2));
       if (channel.name && channel.name.startsWith('UnicastRTP')) { // ExternalMedia channel
         logger.info(`ExternalMedia channel started: ${channel.id}`);
         let mapping = extMap.get(channel.id);
@@ -727,7 +1037,7 @@ function startOpenAIWebSocket(channelId) {
         logger.info(`ExternalMedia channel ${extChannel.id} created and mapped to bridge ${bridge.id}`);
 
         const { ws, getPlaybackComplete, stopStream } = startOpenAIWebSocket(channel.id);
-        sipMap.set(channel.id, { bridge, ws, channelId: channel.id, sendTimeout: null, getPlaybackComplete, stopStream });
+        sipMap.set(channel.id, { bridge, ws, channelId: channel.id, callerNumber, sendTimeout: null, getPlaybackComplete, stopStream });
       } catch (e) {
         logger.error(`Error in SIP channel ${channel.id}: ${e.message}`);
       }

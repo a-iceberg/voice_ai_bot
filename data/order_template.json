@@ -1,0 +1,49 @@
+{
+    "order": {
+        "uslugi_id": "1000",
+        "services": [
+            {
+                "service_id": "Холодильники",
+                "amount": 0,
+                "label": "Тест",
+                "price": "1000",
+                "additionals": []
+            }
+        ],
+        "source": "default",
+        "utm_source": "",
+        "status": "created",
+        "duration_minutes": 0,
+        "desired_dt": "2024-04-01T00:00Z",
+        "employees": [],
+        "payment_type": "card",
+        "callMaster": false,
+        "modelTechnique": "",
+        "productGroupName": "_",
+        "malfunctionName": "-",
+        "client": {
+            "display_name": "Не названо",
+            "phone": ""
+        },
+        "address": {
+            "uri": "",
+            "geopoint": {
+                "longitude": 37.532877,
+                "latitude": 55.902519
+            },
+            "name": "",
+            "floor": "",
+            "entrance": "",
+            "apartment": "",
+            "intercom": "",
+            "name_components": [
+                {
+                    "kind": "locality",
+                    "name": "Москва"
+                }
+            ]
+        },
+        "comment": "",
+        "revision": 0
+    }
+}
