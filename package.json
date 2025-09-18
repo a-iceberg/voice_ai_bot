@@ -1,25 +1,22 @@
 {
-  "name": "asterisk-to-openai-rt",
+  "name": "asterisk_to_openai_rt_adv",
   "version": "1.0.0",
-  "description": "Asterisk Integration with OpenAI Real Time 0.1",
-  "main": "asterisk_to_openai_rt.js",
+  "description": "",
+  "main": "src/index.js",
   "scripts": {
-    "start": "node asterisk_to_openai_rt.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node src/index.js"
   },
-  "author": "Yan",
-  "license": "MIT",
   "dependencies": {
-    "ari-client": "^1.2.0",
-    "async": "^3.2.6",
+    "ari-client": "^2.2.0",
+    "async": "^3.2.4",
     "chalk": "^4.1.2",
-    "dotenv": "^16.4.5",
-    "libphonenumber-js": "^1.12.15",
-    "request": "^2.88.2",
-    "winston": "^3.14.2",
-    "ws": "^8.18.0"
-  },
-  "engines": {
-    "node": ">=14.0.0"
+    "dgram": "^1.0.1",
+    "dotenv": "^16.6.0",
+    "libphonenumber-js": "^1.12.12",
+    "node-udp": "^1.0.5",
+    "uuid": "^9.0.0",
+    "winston": "^3.17.0",
+    "winston-daily-rotate-file": "^5.0.0",
+    "ws": "^8.13.0"
   }
 }
