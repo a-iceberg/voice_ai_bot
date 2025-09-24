@@ -23,7 +23,8 @@
         "malfunctionName": "-",
         "client": {
             "display_name": "Не названо",
-            "phone": ""
+            "phone": "",
+            "phoneIncoming": ""
         },
         "address": {
             "uri": "",

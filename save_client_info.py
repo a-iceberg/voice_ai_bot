@@ -80,6 +80,7 @@ def build_order(client: dict) -> dict:
 
     order["order"]["client"]["display_name"] = client.get("name", "")
     order["order"]["client"]["phone"]        = client.get("phone", "")
+    order["order"]["client"]["phoneIncoming"] = client.get("phone2", "")
 
     # ─ адрес ─
     addr = client.get("address", {})
