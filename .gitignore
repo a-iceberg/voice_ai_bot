@@ -3,6 +3,7 @@ venv/
 
 
 data/auth.json
+data/config.json
 .env
 env_example
 
