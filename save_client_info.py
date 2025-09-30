@@ -1,5 +1,8 @@
-#!/usr/bin/env python3
-# save_client_info.py
+"""
+Скрипт читает JSON клиента из stdin,  =>
+  • сохраняет его в clients_info.txt
+  • формирует заказ и отправляет в API 1С
+"""
 
 import logging, sys, pathlib
 LOG_PATH = pathlib.Path(__file__).with_name('save_client_info.log')
@@ -8,16 +11,10 @@ logging.basicConfig(
     format='%(asctime)s | %(levelname)s | %(message)s',
     handlers=[
         logging.FileHandler(LOG_PATH, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)   # ← остаётся вывод в stdout
+        logging.StreamHandler(sys.stdout) 
     ]
 )
 log = logging.getLogger(__name__)
-# END LOGGING
-"""
-Скрипт читает JSON клиента из stdin,  ➜
-  • сохраняет его в clients_info.txt
-  • формирует заказ и отправляет в API 1С
-"""
 
 import sys, json, uuid, datetime as dt
 import requests
@@ -47,7 +44,7 @@ def russian_address(addr: dict) -> str:
     return ", ".join(part for part in [city, street, house] if part)
 
 def save_to_txt(client: dict) -> None:
-    """Сохраняем информацию клиента в текстовый файл (как раньше)"""
+    """Сохраняем информацию клиента в текстовый файл"""
     a = client.get("address", {})
     with open(BASE_DIR / "clients_info.txt", "a", encoding="utf-8") as file:
         file.write(f"Имя: {client.get('name','')}\n")
@@ -67,22 +64,25 @@ def save_to_txt(client: dict) -> None:
 
 def build_order(client: dict) -> dict:
     """Формируем тело заказа на основе шаблона"""
-    order = json.loads(json.dumps(ORDER_TEMPLATE))  # глубокая копия
+    order = json.loads(json.dumps(ORDER_TEMPLATE))
     now   = dt.datetime.now(MSK_TZ)
     uid   = now.strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:6]
 
-    # ─ базовые поля ─
+    # базовые поля
     order["order"]["uslugi_id"]                 = uid
     order["order"]["services"][0]["service_id"] = client.get("direction", "")
-    # дата приходит как "2025-06-18" → делаем ISO-8601 с Z
+    # дата приходит как "2025-06-18" => делаем ISO-8601 с Z
     visit_raw  = client.get("date", now.date().isoformat())
     order["order"]["desired_dt"] = f"{visit_raw}T00:00Z"
+
+    #модель техники: бренд и модель одной строкой
+    order["order"]["modelTechnique"] = client.get("brand", "")
 
     order["order"]["client"]["display_name"] = client.get("name", "")
     order["order"]["client"]["phone"]        = client.get("phone", "")
     order["order"]["client"]["phoneIncoming"] = client.get("phone2", "")
 
-    # ─ адрес ─
+    # адрес 
     addr = client.get("address", {})
     order["order"]["address"]["name"]      = russian_address(addr)
     order["order"]["address"]["apartment"] = addr.get("apartment", "")
@@ -90,14 +90,28 @@ def build_order(client: dict) -> dict:
     order["order"]["address"]["floor"]     = addr.get("floor", "")
     order["order"]["address"]["intercom"]  = addr.get("intercom", "")
 
+    # name_components: проставляем город
+    city = (addr or {}).get("city")
+    if city:
+        # гарантируем структуру name_components вида [{'kind': 'locality', 'name': <город>}]
+        order["order"]["address"].setdefault("name_components", [])
+        # ищем существующий элемент с kind == 'locality'
+        loc_idx = next((i for i, it in enumerate(order["order"]["address"]["name_components"])
+                        if isinstance(it, dict) and it.get("kind") == "locality"), None)
+        if loc_idx is None:
+            order["order"]["address"]["name_components"].append({"kind": "locality", "name": city})
+        else:
+            order["order"]["address"]["name_components"][loc_idx]["name"] = city
+
     # координаты, если пришли
     lat = addr.get("latitude")
     lon = addr.get("longitude")
     if lat is not None and lon is not None:
         order["order"]["address"]["geopoint"]["latitude"]  = lat
         order["order"]["address"]["geopoint"]["longitude"] = lon
+    
 
-    # ─ комментарий ─
+    # комментарий 
     order["order"]["comment"] = " - ".join(
         part for part in [
             client.get("circumstances", ""),
@@ -120,11 +134,10 @@ def send_order(uid: str, order: dict) -> None:
     with open(BASE_DIR / f"order_sent_{uid}.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
-    # ─ POST в 1С ─
+    # POST в 1С
     try:
         resp = requests.post(order_url, json=payload, timeout=30, verify=False)
 
-        # ↓↓ вставь до resp.raise_for_status() ↓↓
         if resp.status_code >= 400:
             print("== Тело ответа 1С ==")
             try:
@@ -141,7 +154,7 @@ def send_order(uid: str, order: dict) -> None:
               "| Тело ответа:", getattr(err, "response", None) and err.response.text)
         return
 
-    # ─ Запрашиваем номер заявки ─
+    # Запрашиваем номер заявки
     ws_url = cfg["proxy_url"].rstrip("/") + "/ws"
     ws_payload = {
         "config": {
@@ -173,7 +186,7 @@ def send_order(uid: str, order: dict) -> None:
 
 # ────────────────────────────────────────────────────────────────
 def main():
-    # читаем данные JSON из stdin (как и раньше)
+    # читаем данные JSON из stdin
     raw_json = sys.stdin.read().strip()
     if not raw_json:
         print("Нет входных данных.")
