@@ -12,10 +12,10 @@
     "chalk": "^4.1.2",
     "dgram": "^1.0.1",
     "dotenv": "^16.6.0",
-    "libphonenumber-js": "^1.12.12",
+    "libphonenumber-js": "^1.12.23",
     "node-udp": "^1.0.5",
     "uuid": "^9.0.0",
-    "winston": "^3.17.0",
+    "winston": "^3.18.1",
     "winston-daily-rotate-file": "^5.0.0",
     "ws": "^8.13.0"
   }

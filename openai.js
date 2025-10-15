@@ -43,14 +43,16 @@ function validateRussianPhone(raw) {
 }
 
 async function runValidatePhone(args) {
-  // args может быть строкой JSON или объектом
   const a = (typeof args === 'string') ? JSON.parse(args) : args;
   const raw = String(a?.phone ?? '');
+  logger.info(`🔍 [PHONE] Валидация телефона через tools: "${raw}"`);   // +++
+
   const normalized = validateRussianPhone(raw);
   if (!normalized) {
-    // один переспрос вы уже закрепили в промпте — здесь только машинный результат
+    logger.warn(`[PHONE] Некорректный телефон: ${raw}`);                // +++
     return JSON.stringify({ ok: false, reason: 'invalid' });
   }
+  logger.info(`[PHONE] Валидный телефон: ${normalized}`);               // +++
   return JSON.stringify({ ok: true, normalized });
 }
 async function handleValidatePhone(call, ws, logger) {
@@ -98,6 +100,61 @@ async function handleValidatePhone(call, ws, logger) {
         }
       }));
     }
+  }
+}
+
+async function runValidateAddress(args) {
+  const a = (typeof args === 'string') ? JSON.parse(args) : args;
+  const city = String(a?.city || '').trim();
+  const street = String(a?.street || '').trim();
+  const house = String(a?.house_number || '').trim();
+
+  const query = [city, street, house].filter(Boolean).join(', ');
+  logger.info(`🔍 [ADDRESS] Валидация адреса: "${query}"`);
+  if (!query) {
+    logger.warn(`[ADDRESS] Пустой адрес, валидация не выполнена`);
+    return JSON.stringify({ ok: false, reason: 'empty' });
+  }
+
+  try {
+    const url = new URL('https://nominatim.openstreetmap.org/search');
+    url.searchParams.set('q', query);
+    url.searchParams.set('format', 'json');
+    url.searchParams.set('limit', '1');
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'IcebergBot/1.0 (asterisk_to_openai_rt)' },
+      timeout: 10000
+    });
+    if (!resp.ok) {
+      return JSON.stringify({ ok: false, reason: `http_${resp.status}` });
+    }
+    const data = await resp.json();
+    if (!Array.isArray(data) || data.length === 0) {
+      logger.warn(`[ADDRESS] Адрес не найден: "${query}"`);
+      return JSON.stringify({ ok: false, reason: 'not_found' });
+    }
+
+    const hit = data[0];
+    // извлечём нормализованные части, когда есть
+    const display_name = hit.display_name;
+    const latitude  = Number(hit.lat);
+    const longitude = Number(hit.lon);
+
+    // Пытаемся достать компоненты адреса (иногда приходят в hit.address)
+    let norm = { city, street, house_number: house };
+    if (hit.address) {
+      norm.city         = hit.address.city || hit.address.town || hit.address.village || norm.city;
+      norm.street       = hit.address.road || hit.address.pedestrian || norm.street;
+      norm.house_number = hit.address.house_number || norm.house_number;
+    }
+    logger.info(`[ADDRESS] Валидный адрес: ${display_name} (${latitude}, ${longitude})`);
+    return JSON.stringify({
+      ok: true,
+      normalized: { ...norm, latitude, longitude, display_name }
+    });
+  } catch (e) {
+    logger.error(`[ADDRESS] Ошибка при валидации: ${e.message}`);
+    return JSON.stringify({ ok: false, reason: 'exception' });
   }
 }
 // Асинхронная обработка вызова функции save_client_info
@@ -340,7 +397,13 @@ async function startOpenAIWebSocket(channelId) {
             const { name, call_id, arguments: args } = out;
 
             if (name === 'validate_phone') {
+              logger.info(`[PHONE] function_call: ${args}`);
               const result = await runValidatePhone(args);
+              sendFunctionResult(ws, call_id, result);
+            }
+            if (name === 'validate_address') {
+              logger.info(`[ADDRESS] function_call: ${args}`);
+              const result = await runValidateAddress(args);
               sendFunctionResult(ws, call_id, result);
             }
 
@@ -559,7 +622,21 @@ const tools = [
         }
       }
     }
+  },
+  {
+  type: 'function',
+  name: 'validate_address',
+  description: 'Проверяет адрес через Nominatim (OSM), возвращает нормализованный адрес и координаты.',
+  parameters: {
+    type: 'object',
+    required: ['city','street','house_number'],
+    properties: {
+      city:        { type: 'string', description: 'Город' },
+      street:      { type: 'string', description: 'Улица' },
+      house_number:{ type: 'string', description: 'Дом / корпус / строение' }
+    }
   }
+}
 ];
 
       ws.on('open', async () => {
