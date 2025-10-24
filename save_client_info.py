@@ -19,6 +19,8 @@ log = logging.getLogger(__name__)
 import sys, json, uuid, datetime as dt
 import requests
 from pathlib import Path
+import re
+from datetime import datetime
 
 # ────────────────────────────────────────────────────────────────
 # 1. Настройки окружения
@@ -66,14 +68,34 @@ def build_order(client: dict) -> dict:
     """Формируем тело заказа на основе шаблона"""
     order = json.loads(json.dumps(ORDER_TEMPLATE))
     now   = dt.datetime.now(MSK_TZ)
-    uid   = now.strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:6]
+    uid_   = now.strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:6]
 
     # базовые поля
-    order["order"]["uslugi_id"]                 = uid
+    phone_incoming = client.get("phone2") or client.get("phoneIncoming") or client.get("phone")
+    phone_digits = ''.join(filter(str.isdigit, phone_incoming))
+    uid = now.strftime("%Y%m%d%H%M%S") + phone_digits
+    order["order"]["uslugi_id"] = uid
     order["order"]["services"][0]["service_id"] = client.get("direction", "")
     # дата приходит как "2025-06-18" => делаем ISO-8601 с Z
     visit_raw  = client.get("date", now.date().isoformat())
-    order["order"]["desired_dt"] = f"{visit_raw}T00:00Z"
+
+    now = datetime.now()
+    # дата из клиента (что сказал бот)
+    visit_raw_raw = (client.get("date") or "").strip()
+    visit_raw = visit_raw_raw if visit_raw_raw else None
+    # дата из шаблона (гарантированно есть)
+    template_dt = ORDER_TEMPLATE["order"]["desired_dt"]
+    # формируем значение
+    if visit_raw:
+        candidate_dt = f"{visit_raw}T00:00Z"
+    else:
+        candidate_dt = template_dt
+    # проверка валидности
+    iso_midnight = re.compile(r"^\d{4}-\d{2}-\d{2}T00:00Z$")
+    if not iso_midnight.match(candidate_dt):
+        # если формат битый — fallback на шаблон
+        candidate_dt = template_dt
+    order["order"]["desired_dt"] = candidate_dt
 
     #модель техники: бренд и модель одной строкой
     order["order"]["modelTechnique"] = client.get("brand", "")
@@ -89,6 +111,8 @@ def build_order(client: dict) -> dict:
     order["order"]["address"]["entrance"]  = addr.get("entrance", "")
     order["order"]["address"]["floor"]     = addr.get("floor", "")
     order["order"]["address"]["intercom"]  = addr.get("intercom", "")
+
+    order["order"]["multipleRequest"]   = bool(client.get("multipleRequest", order["order"].get("multipleRequest", False)))
 
     # name_components: проставляем город
     city = (addr or {}).get("city")
@@ -107,6 +131,7 @@ def build_order(client: dict) -> dict:
     lat = addr.get("latitude")
     lon = addr.get("longitude")
     if lat is not None and lon is not None:
+        order["order"]["address"].setdefault("geopoint", {})
         order["order"]["address"]["geopoint"]["latitude"]  = lat
         order["order"]["address"]["geopoint"]["longitude"] = lon
     
@@ -156,21 +181,50 @@ def send_order(uid: str, order: dict) -> None:
 
     # Запрашиваем номер заявки
     ws_url = cfg["proxy_url"].rstrip("/") + "/ws"
+    def _get_locality(order: dict) -> str:
+        comps = (order["order"]["address"] or {}).get("name_components", [])
+        for it in comps:
+            if isinstance(it, dict) and it.get("kind") == "locality" and it.get("name"):
+                return it["name"]
+        return (order["order"]["address"].get("name") or "").split(",")[0].strip()
+
+    city = _get_locality(order)
+    if "Санкт" in city or "Петербург" in city or "СПб" in city:
+        cp = "spb"
+    elif "Москва" in city or "Моск" in city:
+        cp = "msk"
+    else:
+        cp = "reg"
+    
+    ws_path = (cfg.get("ws_paths") or {}).get(cp)
+    if not ws_path:
+        raise RuntimeError(f"Не найден ws_path для cp='{cp}'")
+
+    ws_client_path = {cp: ws_path}
+
+    phone_incoming = (order["order"].get("client", {}) or {}).get("phoneIncoming") or ""
+    phone_digits = ''.join(filter(str.isdigit, phone_incoming))
+    partner_id = phone_digits or "0"
+
     ws_payload = {
         "config": {
-            "clientPath": cfg["ws_paths"],
+            "clientPath": ws_client_path,
             "login":  auth["LOGIN_1C"],
             "password": auth["PASSWORD_1C"],
         },
         "params": {
             "Идентификатор": "new_bid_number",
-            "НомерПартнера": uid
+            "ИДЧата": str(partner_id)
         },
         "token": token
     }
+    print("[WS] cp =", cp, "| clientPath =", ws_client_path, "| ИДЧата =", partner_id)
 
     try:
         ws_resp = requests.post(ws_url, json=ws_payload, timeout=30, verify=False)
+        if ws_resp.status_code >= 400:
+            try: print("== Тело ответа /ws ==", ws_resp.json(), sep="\n")
+            except Exception: print("== Тело ответа /ws ==", ws_resp.text, sep="\n")
         ws_resp.raise_for_status()
         result = ws_resp.json().get("result", {})
         req_number = next(
@@ -180,6 +234,7 @@ def send_order(uid: str, order: dict) -> None:
         if req_number:
             print("✅ Номер новой заявки:", req_number)
         else:
+            print("== /ws result debug ==", json.dumps(result, ensure_ascii=False, indent=2))
             print("⚠ Заявка создана, но номер вернуть не удалось (проверьте логи 1С).")
     except requests.RequestException as err:
         print("⚠ Заявка создана, но не удалось узнать номер:", err)

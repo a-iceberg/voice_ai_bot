@@ -7,6 +7,25 @@ const { streamAudio, rtpEvents } = require('./rtp');
 
 logger.info('Loading openai.js module');
 
+//-----------------------------
+const { DateTime } = require("luxon");
+require("dotenv").config();
+
+const TZ = "Europe/Moscow";
+const now = DateTime.now().setZone(TZ);
+const nowDateISO = now.toISODate();
+const nowWeekday = now.setLocale("ru").toFormat("cccc");
+
+const baseSystemPrompt = process.env.SYSTEM_PROMPT;
+
+// объединяем: сначала "дату", потом основной промпт
+const systemPromptFinal = [
+  `Сегодня: ${nowDateISO} (${nowWeekday}). Текущий часовой пояс: ${TZ}.`,
+  `Если клиент говорит "сегодня", "завтра", "послезавтра" или относительные выражения — вычисли конкретную дату в формате YYYY-MM-DD относительно ${nowDateISO}.`,
+  baseSystemPrompt
+].join("\n\n");
+//-----------------------------
+
 function sendFunctionResult(ws, call_id, outputText) {
   // output должен быть СТРОКОЙ
   const out = (typeof outputText === 'string') ? outputText : JSON.stringify(outputText);
@@ -603,7 +622,7 @@ const tools = [
             longitude:   { type: 'number', description: 'Долгота' }
           }
         },
-        date:   { type: 'string', description: 'Желаемая дата визита (YYYY-MM-DD)' },
+        date:   { type: 'string', description: 'Желаемая дата визита (YYYY-MM-DD). Конвертируй относительные фразы на основе текущей даты из системного сообщения.', pattern: '^\\d{4}-\\d{2}-\\d{2}$' },
         comment:{ type: 'string', description: 'Дополнительный комментарий' }
       }
     }
@@ -646,7 +665,7 @@ const tools = [
           session: {
             modalities: ['audio', 'text'],
             voice: config.OPENAI_VOICE || 'alloy',
-            instructions: config.SYSTEM_PROMPT,
+            instructions: systemPromptFinal,
             input_audio_format: 'g711_ulaw',
             output_audio_format: 'g711_ulaw',
             input_audio_transcription: {
@@ -689,7 +708,7 @@ const tools = [
             type: 'response.create',
             response: {
               modalities: ['audio', 'text'],
-              instructions: config.SYSTEM_PROMPT,
+              instructions: systemPromptFinal,
               output_audio_format: 'g711_ulaw'
             }
           }));
