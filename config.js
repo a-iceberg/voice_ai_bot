@@ -20,7 +20,8 @@ const config = {
   SYSTEM_PROMPT: process.env.SYSTEM_PROMPT,
   INITIAL_MESSAGE: process.env.INITIAL_MESSAGE || 'Hi',
   SILENCE_PADDING_MS: parseInt(process.env.SILENCE_PADDING_MS) || 100,
-  CALL_DURATION_LIMIT_SECONDS: parseInt(process.env.CALL_DURATION_LIMIT_SECONDS) || 0 // 0 means no limit
+  CALL_DURATION_LIMIT_SECONDS: parseInt(process.env.CALL_DURATION_LIMIT_SECONDS) || 0, // 0 means no limit
+  MAX_VALIDATION_RETRIES: parseInt(process.env.MAX_VALIDATION_RETRIES) || 3
 };
 
 let sentEventCounter = 0;
