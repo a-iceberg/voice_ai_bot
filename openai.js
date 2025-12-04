@@ -15,7 +15,6 @@ const TZ = "Europe/Moscow";
 const now = DateTime.now().setZone(TZ);
 const nowDateISO = now.toISODate();
 const nowWeekday = now.setLocale("ru").toFormat("cccc");
-
 const baseSystemPrompt = process.env.SYSTEM_PROMPT;
 
 // объединяем: сначала "дату", потом основной промпт
@@ -37,9 +36,112 @@ const CORRECTION_PATTERNS = [
   /\bповтор(и|ите)\b/i
 ];
 
+
+
 function hasCorrectionIntent(text) {
   const t = (text || '').toLowerCase();
   return CORRECTION_PATTERNS.some(rx => rx.test(t));
+}
+
+function normalizePhoneToE164Like(input) {
+  if (!input) return '';
+  const digits = String(input).replace(/\D+/g, '');
+  if (digits.length === 11 && digits.startsWith('8')) return '7' + digits.slice(1);
+  if (digits.length === 10) return '7' + digits;
+  return digits; // уже с кодом страны
+}
+
+function normalizeAddressArgs(obj = {}) {
+  // мягкая нормализация: трим/нижний регистр для текстовых полей
+  const pick = (v) => (typeof v === 'string' ? v.trim().toLowerCase() : v || '');
+  return {
+    city: pick(obj.city),
+    street: pick(obj.street),
+    house_number: pick(obj.house_number),
+    apartment: pick(obj.apartment),
+    // при желании: корпус/строение и т.п.
+  };
+}
+
+// поверхностное равенство по строке JSON
+const shallowEqualJSON = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+const REPAIRABLE_TOOLS = {
+  validate_phone: {
+    slot: 'phone',
+    takeCurrent: (args) => {
+      const obj = typeof args === 'string' ? JSON.parse(args) : (args || {});
+      const raw = obj.number ?? obj.phone ?? '';
+      return { raw, normalized: normalizePhoneToE164Like(raw) };
+    },
+    takePreviousFromCh: (ch) => ch.lastToolArgs?.phone ?? null,
+    saveToCh: (ch, curr) => {
+      ch.lastToolArgs = ch.lastToolArgs || {};
+      ch.lastToolArgs.phone = { raw: curr.raw, normalized: curr.normalized };
+    },
+    isSame: (prev, curr) => !!prev && !!curr && prev.normalized && curr.normalized && prev.normalized === curr.normalized,
+    looksInvalid: (curr) => !curr.normalized || curr.normalized.length < 10 || curr.normalized.length > 15,
+    hint: 'Пересобери телефон по последним фразам клиента и вызови validate_phone с корректным номером (не используй старые цифры).',
+  },
+
+  validate_address: {
+    slot: 'address',
+    takeCurrent: (args) => {
+      const obj = typeof args === 'string' ? JSON.parse(args) : (args || {});
+      return { raw: obj, norm: normalizeAddressArgs(obj) };
+    },
+    takePreviousFromCh: (ch) => ch.lastToolArgs?.address ?? null,
+    saveToCh: (ch, curr) => {
+      ch.lastToolArgs = ch.lastToolArgs || {};
+      ch.lastToolArgs.address = curr; // храним и raw, и norm
+    },
+    isSame: (prev, curr) => !!prev && !!curr && shallowEqualJSON(prev.norm, curr.norm),
+    looksInvalid: (curr) => {
+      const { city, street } = curr.norm || {};
+      return !city || !street; // мягкая эвристика
+    },
+    hint: 'Пересобери адрес по последним репликам (город, улица, дом, кв) и вызови validate_address с новыми аргументами (не используй старые).',
+  },
+};
+
+async function triggerSelfRepair(ws, channelId, toolName, currArgs, reason) {
+  const cfg = REPAIRABLE_TOOLS[toolName];
+  const hint = cfg?.hint || 'Пересобери аргументы по последним репликам и повторно вызови инструмент.';
+
+  // берём короткое окно последних реплик
+  const ch = sipMap.get(channelId) || {};
+  const lines = (ch.transcriptWindow || [])
+    .map(x => `${x.role === 'user' ? 'Клиент' : 'Ассистент'}: ${x.text}`)
+    .slice(-8).join('\n');
+
+  ws.send(JSON.stringify({
+    type: 'conversation.item.create',
+    item: {
+      type: 'message',
+      role: 'user',
+      content: [{
+        type: 'input_text',
+        text:
+`[СЛУЖЕБНО] Авто-ремонт tool=${toolName} (reason=${reason}).
+Последние реплики:
+${lines}
+
+Предыдущие аргументы (нормализованные/сырые):
+${JSON.stringify(currArgs)}
+
+Инструкция:
+${hint}`
+      }]
+    }
+  }));
+
+  ws.send(JSON.stringify({
+    type: 'response.create',
+    response: {
+      modalities: ['audio','text'],
+      instructions: `Выполни переразбор последних реплик и повторно вызови ${toolName} уже с исправленными аргументами.`,
+    }
+  }));
 }
 
 function sendFunctionResult(ws, call_id, outputText) {
@@ -318,6 +420,11 @@ async function startOpenAIWebSocket(channelId) {
   let messageQueue = [];
   let itemRoles = new Map();
   let lastUserItemId = null;
+  let transcriptWindow = [];
+function pushTranscript(role, text) {
+  transcriptWindow.push({ role, text, t: Date.now() });
+  if (transcriptWindow.length > 10) transcriptWindow.shift();
+}
 
   const processMessage = async (response) => {
     try {
@@ -352,16 +459,54 @@ async function startOpenAIWebSocket(channelId) {
         for (const out of outputs) {
           if (out.type === 'function_call') {
             const { name, call_id, arguments: args } = out;
+            // --- ЕДИНАЯ АНТИ-ЗАЛИПАЛКА ДЛЯ РЕМОНТА ---
+            const toolCfg = REPAIRABLE_TOOLS[name];
+            if (toolCfg) {
+              const ch = sipMap.get(channelId) || {};
+              const curr = toolCfg.takeCurrent(args);
+              const prev = toolCfg.takePreviousFromCh(ch);
+
+              const retryCounters = ch.retryCounters || {};
+              const retryCount = retryCounters[toolCfg.slot] || 0;
+
+              // 5.1. если явная «битость» аргументов (пусто/слишком коротко) — не валидируем, а просим саморемонт
+              if (toolCfg.looksInvalid && toolCfg.looksInvalid(curr) && retryCount > 0) {
+                logger.warn(`[REPAIR] ${name}: looks invalid -> self-repair (retry=${retryCount})`);
+                await triggerSelfRepair(ws, channelId, name, curr, 'looks_invalid');
+                sendFunctionResult(ws, call_id, JSON.stringify({ ok: false, reason: 'invalid_args' }));
+                continue; // прерываем штатный вызов
+              }
+
+              // 5.2. если аргументы совпадают с предыдущими (залипание) — саморемонт
+              if (toolCfg.isSame && toolCfg.isSame(prev, curr) && retryCount > 0) {
+                logger.warn(`[REPAIR] ${name}: same args as previous -> self-repair (retry=${retryCount})`);
+                await triggerSelfRepair(ws, channelId, name, curr, 'same_args');
+                sendFunctionResult(ws, call_id, JSON.stringify({ ok: false, reason: 'same_as_previous' }));
+                continue;
+              }
+
+              // 5.3. если всё ок — сохраняем «последние аргументы» для дальнейшего сравнения
+              toolCfg.saveToCh(ch, curr);
+              sipMap.set(channelId, ch);
+            }
+              let toolResult = null;
+
+            const KNOWN_TOOLS = new Set(['validate_phone','validate_address','save_client_info']);
+
+            if (!REPAIRABLE_TOOLS[name] && !KNOWN_TOOLS.has(name)) {
+              logger.warn(`[TOOLS] Unknown function_call: ${name}`);
+              continue;
+            }
 
             if (name === 'validate_phone') {
               const ch = sipMap.get(channelId);
+              ch.retryCounters = ch.retryCounters || { phone: 0, address: 0 }
               ch.retryCounters.phone = (ch.retryCounters.phone || 0) + 1;
               sipMap.set(channelId, ch);
 
               logger.info(`[PHONE] function_call attempt ${ch.retryCounters.phone}: ${args}`);
 
               if (ch.retryCounters.phone >= config.MAX_VALIDATION_RETRIES) {
-                // Превышен лимит
                 logger.warn(`[PHONE] Max retries reached for ${channelId}, skipping validation`);
                 ws.send(JSON.stringify({
                   type: 'response.create',
@@ -371,44 +516,19 @@ async function startOpenAIWebSocket(channelId) {
                     temperature: 0.6
                   }
                 }));
-                // сбрасываем счётчик
                 ch.retryCounters.phone = 0;
                 sipMap.set(channelId, ch);
-                sendFunctionResult(ws, call_id, JSON.stringify({ ok: true, skipped: true }));
+
+                toolResult = JSON.stringify({ ok: true, skipped: true });
+                sendFunctionResult(ws, call_id, toolResult);
               } else {
-                const result = await runValidatePhone(args);
-                sendFunctionResult(ws, call_id, result);
-
-                const ch = sipMap.get(channelId);
-                if (ch?.slots) {
-                  const key = name === 'validate_phone' ? 'phone' : 'address';
-                  ch.slots[key].pendingTool = null;
-                  try {
-                    const parsed = JSON.parse(result);
-                    ch.slots[key].validated = parsed.ok === true;
-                  } catch {
-                    ch.slots[key].validated = false;
-                  }
-                  sipMap.set(channelId, ch);
-                  logger.info(`[LOCK] Slot ${key} validated=${ch.slots[key].validated} for ${channelId}`);
-                }
-
-                try {
-                const parsed = JSON.parse(result);
-                if (parsed.ok === true) {
-                  const ch = sipMap.get(channelId);
-                  if (ch && ch.retryCounters) {
-                    ch.retryCounters.phone = 0;
-                    sipMap.set(channelId, ch);
-                    logger.info(`[PHONE] ✅ Validation succeeded — retry counter reset for ${channelId}`);
-                  }
-                }
-              } catch (_) { /* ignore parse errors */ }
-                
+                toolResult = await runValidatePhone(args);
+                sendFunctionResult(ws, call_id, toolResult);
               }
             }
-            if (name === 'validate_address') {
+            else if (name === 'validate_address') {
               const ch = sipMap.get(channelId);
+              ch.retryCounters = ch.retryCounters || { phone: 0, address: 0 };
               ch.retryCounters.address = (ch.retryCounters.address || 0) + 1;
               sipMap.set(channelId, ch);
 
@@ -426,40 +546,16 @@ async function startOpenAIWebSocket(channelId) {
                 }));
                 ch.retryCounters.address = 0;
                 sipMap.set(channelId, ch);
-                sendFunctionResult(ws, call_id, JSON.stringify({ ok: true, skipped: true }));
+
+                toolResult = JSON.stringify({ ok: true, skipped: true });
+                sendFunctionResult(ws, call_id, toolResult);
               } else {
-                const result = await runValidateAddress(args);
-                sendFunctionResult(ws, call_id, result);
-
-                                const ch = sipMap.get(channelId);
-                if (ch?.slots) {
-                  const key = name === 'validate_phone' ? 'phone' : 'address';
-                  ch.slots[key].pendingTool = null;
-                  try {
-                    const parsed = JSON.parse(result);
-                    ch.slots[key].validated = parsed.ok === true;
-                  } catch {
-                    ch.slots[key].validated = false;
-                  }
-                  sipMap.set(channelId, ch);
-                  logger.info(`[LOCK] Slot ${key} validated=${ch.slots[key].validated} for ${channelId}`);
-                }
-
-                try {
-                  const parsed = JSON.parse(result);
-                  if (parsed.ok === true) {
-                    const ch = sipMap.get(channelId);
-                    if (ch && ch.retryCounters) {
-                      ch.retryCounters.address = 0;
-                      sipMap.set(channelId, ch);
-                      logger.info(`[ADDRESS] ✅ Validation succeeded — retry counter reset for ${channelId}`);
-                    }
-                  }
-                } catch (_) { /* ignore parse errors */ }
+                toolResult = await runValidateAddress(args);
+                sendFunctionResult(ws, call_id, toolResult);
               }
             }
 
-            if (name === 'save_client_info') {
+            else if (name === 'save_client_info') {
               // args → это JSON с полями заявки (name, direction, phone, address, и т.д.)
               // запускаем ваш Python-скрипт и возвращаем номер заявки
               const a = (typeof args === 'string') ? JSON.parse(args) : args;
@@ -544,6 +640,46 @@ async function startOpenAIWebSocket(channelId) {
                 sendFunctionResult(ws, call_id, JSON.stringify({ ok: false, error: 'save_failed' }));
               }
             }
+                        // === ЕДИНЫЙ ПОСТ-ОБРАБОТЧИК ДЛЯ phone И address ===
+            if (name === 'validate_phone' || name === 'validate_address') {
+              if (!toolResult) { 
+                  logger.warn(`[POST-RESULT] ${name}: empty toolResult`);
+                  continue;
+                }
+              try {
+                const parsed = JSON.parse(toolResult);
+                let ch = sipMap.get(channelId);
+                const slot = name === 'validate_phone' ? 'phone' : 'address';
+
+                // 1) Обновляем слоты
+                if (ch?.slots) {
+                  ch.slots[slot].pendingTool = null;
+                  ch.slots[slot].validated = parsed.ok === true;
+                  logger.info(`[LOCK] Slot ${slot} validated=${ch.slots[slot].validated} for ${channelId}`);
+                }
+
+                // 2) Счётчики ретраев + авто-ремонт
+                const retry = (ch?.retryCounters?.[slot] || 0);
+
+                if (parsed.ok === true) {
+                  if (ch?.retryCounters) {
+                    ch.retryCounters[slot] = 0; // сброс счётчика КОНКРЕТНОГО слота
+                    logger.info(`[${slot.toUpperCase()}] ✅ Validation succeeded — retry counter reset for ${channelId}`);
+                  }
+                } else {
+                  // неуспех -> если это не первая попытка — self-repair
+                  if (retry > 0 && REPAIRABLE_TOOLS?.[name]) {
+                    const prev = REPAIRABLE_TOOLS[name].takePreviousFromCh(ch);
+                    logger.warn(`[REPAIR] ${name}(${slot}): tool returned ok:false on retry=${retry} -> self-repair`);
+                    await triggerSelfRepair(ws, channelId, name, prev || {}, 'fail_result');
+                  }
+                }
+
+                sipMap.set(channelId, ch);
+              } catch (e) {
+                logger.error(`[POST-RESULT] ${name}: cannot parse tool result: ${e?.message || e}`);
+              }
+            }
           }
         }
         break;
@@ -596,8 +732,14 @@ async function startOpenAIWebSocket(channelId) {
 
             if (role === 'Assistant') {
               logOpenAI(`Assistant transcription for ${channelId}: ${text}`, 'info');
+              // --- сохраняем реплику ассистента в историю транскриптов канала ---
+              let ch = sipMap.get(channelId) || {};
+              ch.transcriptWindow = ch.transcriptWindow || [];
+              ch.transcriptWindow.push({ role: 'assistant', text, t: Date.now() });
+              if (ch.transcriptWindow.length > 10) ch.transcriptWindow.shift();
+              sipMap.set(channelId, ch);
 
-              const ch = sipMap.get(channelId);
+              ch = sipMap.get(channelId);
               if (ch?.slots) {
                 const tryingToSkip = /\bпер(е|е)йд(е|ё)м|дал(е|ё)е\b/i.test(text); // «перейдём», «далее»
                 const unconfirmed = (!ch.slots.phone.validated || !ch.slots.address.validated);
@@ -636,9 +778,15 @@ async function startOpenAIWebSocket(channelId) {
             logger.debug(`User transcript completed - Full message: ${JSON.stringify(response, null, 2)}`);
             const text = response.transcript;
             logOpenAI(`User command transcription for ${channelId}: ${text}`, 'info');
+            // --- сохраняем реплику пользователя в историю транскриптов канала ---
+            let ch = sipMap.get(channelId) || {};
+            ch.transcriptWindow = ch.transcriptWindow || [];
+            ch.transcriptWindow.push({ role: 'user', text, t: Date.now() });
+            if (ch.transcriptWindow.length > 10) ch.transcriptWindow.shift();
+            sipMap.set(channelId, ch);
 
             // --- мягкий сторож коррекций ---
-            const ch = sipMap.get(channelId);
+            ch = sipMap.get(channelId);
             if (ch?.slots && hasCorrectionIntent(text)) {
               // если недавно валидировали телефон/адрес — считаем, что правят текущий незакрытый слот
               // приоритет: address, затем phone (чаще правят адрес позднее)
@@ -681,6 +829,15 @@ async function startOpenAIWebSocket(channelId) {
         case 'error':
           logger.error(`OpenAI error for ${channelId}: ${response.error.message}`);
           ws.close();
+          break;
+        case "conversation.item.input_audio_transcription.delta":
+          logger.debug(`[OpenAI] user speech (partial) for ${channelId}: ${response.delta}`);
+          break;
+
+        case "conversation.item.input_audio_transcription.completed":
+          const text = response.transcript;
+          logOpenAI(`User transcription for ${channelId}: ${text}`);
+    
           break;
         default:
           logger.debug(`Unhandled event type: ${response.type} for ${channelId}`);
@@ -810,7 +967,7 @@ const tools = [
             input_audio_format: 'g711_ulaw',
             output_audio_format: 'g711_ulaw',
             input_audio_transcription: {
-              model: 'whisper-1',
+              model: 'gpt-4o-transcribe',
               language: 'ru'
             },
             turn_detection: {
@@ -819,6 +976,7 @@ const tools = [
               prefix_padding_ms: config.VAD_PREFIX_PADDING_MS || 200,
               silence_duration_ms: config.VAD_SILENCE_DURATION_MS || 600
             },
+            include: ["item.input_audio_transcription.logprobs"],
             "temperature": 0.6,
             tools,
             tool_choice: 'auto'
