@@ -1,15 +1,28 @@
 const DailyRotateFile = require('winston-daily-rotate-file');
 
+const fs = require('fs');
+const path = require('path');
+
 require('dotenv').config({ path: './config.conf' });
 const winston = require('winston');
 const chalk = require('chalk');
 
+// читаем data/auth.json 
+const authPath = path.join(__dirname, 'data', 'auth.json');
+let auth = {};
+try {
+  auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+} catch (e) {
+  console.error(`Не удалось прочитать ${authPath}:`, e.message);
+  process.exit(1);
+}
+// конфиг
 const config = {
-  ARI_URL: 'http://127.0.0.1:8088',
-  ARI_USER: 'asterisk',
-  ARI_PASS: 'asterisk',
+  ARI_URL: process.env.ARI_URL || 'http://127.0.0.1:8088',
+  ARI_USER: auth.ARI_USER || process.env.ARI_USERNAME || 'asterisk',
+  ARI_PASS: auth.ARI_PASS || process.env.ARI_PASSWORD || 'asterisk',
   ARI_APP: 'stasis_app',
-  OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+  OPENAI_API_KEY: auth.OPENAI_API_KEY || process.env.OPENAI_API_KEY,
   REALTIME_URL: `wss://api.openai.com/v1/realtime?model=${process.env.REALTIME_MODEL || 'gpt-4o-mini-realtime-preview-2024-12-17'}`,
   RTP_PORT_START: 12000,
   MAX_CONCURRENT_CALLS: parseInt(process.env.MAX_CONCURRENT_CALLS) || 10,
