@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  voice_ai_bot:
+    build: .
+    container_name: voice_ai_bot
+    restart: always
+    # чтобы Asterisk и RTP продолжали работать как сейчас
+    network_mode: host
+
+    environment:
+      - NODE_ENV=production
+
+    volumes:
+      # конфиг с ключами и промптом
+      - ./config.conf:/usr/src/voice_ai_bot/config.conf:ro
+
+      # рабочие данные (auth.json, config.json, order_template.json)
+      - ./data:/usr/src/voice_ai_bot/data
+
+      # папка для логов 
+      - ./logs:/usr/src/voice_ai_bot/logs
+
+      # итоговые заявки 
+      - ./order_sent:/usr/src/voice_ai_bot/order_sent
+
+      # текстовый файл с клиентами
+      - ./clients_info.txt:/usr/src/voice_ai_bot/clients_info.txt
+
+

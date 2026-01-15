@@ -1,0 +1,22 @@
+# зависимости
+node_modules
+venv
+
+# гит и служебное
+.git
+.gitignore
+Dockerfile
+docker-compose.yml
+
+# конфиги и ключи (будут монтироваться с хоста)
+config.conf
+data
+clients_info.txt
+
+# логи и временные файлы
+logs
+*.log
+order_sent_*.json
+order_sent
+npm-debug.log*
+save_client_info.log

@@ -3,28 +3,44 @@
   • сохраняет его в clients_info.txt
   • формирует заказ и отправляет в API 1С
 """
-
-import logging, sys, pathlib
-LOG_PATH = pathlib.Path(__file__).with_name('save_client_info.log')
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_PATH, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout) 
-    ]
-)
-log = logging.getLogger(__name__)
-
-import sys, json, uuid, datetime as dt
+import sys
+import json
+import uuid
+import datetime as dt
+import re
+import logging
 import requests
 from pathlib import Path
-import re
 from datetime import datetime
+
+# Базовые пути
+BASE_DIR = Path(__file__).resolve().parent
+
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+ORDER_DIR = BASE_DIR / "order_sent"
+ORDER_DIR.mkdir(exist_ok=True)
+
+LOG_PATH = LOG_DIR / "save_client_info.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+
+log = logging.getLogger(__name__)
+
 
 # ────────────────────────────────────────────────────────────────
 # 1. Настройки окружения
 BASE_DIR = Path(__file__).resolve().parent
+ORDER_DIR = BASE_DIR / "order_sent"
+ORDER_DIR.mkdir(exist_ok=True)
 
 with open(BASE_DIR / "data/auth.json", encoding="utf-8") as f:
     auth = json.load(f)                 # TOKEN_1C, LOGIN_1C, PASSWORD_1C …
@@ -156,7 +172,7 @@ def send_order(uid: str, order: dict) -> None:
     payload = {"config": order_data, "params": order, "token": token}
 
     # сохраняем в файл для отладки
-    with open(BASE_DIR / f"order_sent_{uid}.json", "w", encoding="utf-8") as f:
+    with open(ORDER_DIR / f"order_sent_{uid}.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
     # POST в 1С
@@ -164,19 +180,22 @@ def send_order(uid: str, order: dict) -> None:
         resp = requests.post(order_url, json=payload, timeout=30, verify=False)
 
         if resp.status_code >= 400:
-            print("== Тело ответа 1С ==")
             try:
                 print(resp.json())          # если это JSON
+                log.error("== Тело ответа 1С ==\n%s", resp.json()) 
             except Exception:
-                print(resp.text)            # иначе как текст
-            print("====================")
+                log.error("== Тело ответа 1С ==\n%s", resp.text)            # иначе как текст
+            log.error("======================================")
 
         resp.raise_for_status()
 
-        print("Заказ передан в 1С (HTTP", resp.status_code, ")")
+        log.info("Заказ передан в 1С (HTTP %s)", resp.status_code)
     except requests.RequestException as err:
-        print("❌ Ошибка при создании заявки:", err,
-              "| Тело ответа:", getattr(err, "response", None) and err.response.text)
+        log.error(
+            "❌ Ошибка при создании заявки: %s | Тело ответа: %s",
+            err,
+            getattr(err, "response", None) and err.response.text,
+        )
         return
 
     # Запрашиваем номер заявки
@@ -218,13 +237,15 @@ def send_order(uid: str, order: dict) -> None:
         },
         "token": token
     }
-    print("[WS] cp =", cp, "| clientPath =", ws_client_path, "| ИДЧата =", partner_id)
+    log.info("[WS] cp=%s | clientPath=%s | ИДЧата=%s", cp, ws_client_path, partner_id)
 
     try:
         ws_resp = requests.post(ws_url, json=ws_payload, timeout=30, verify=False)
         if ws_resp.status_code >= 400:
-            try: print("== Тело ответа /ws ==", ws_resp.json(), sep="\n")
-            except Exception: print("== Тело ответа /ws ==", ws_resp.text, sep="\n")
+            try:
+                log.error("== Тело ответа /ws ==\n%s", ws_resp.json())
+            except Exception:
+                log.error("== Тело ответа /ws ==\n%s", ws_resp.text)
         ws_resp.raise_for_status()
         result = ws_resp.json().get("result", {})
         req_number = next(
@@ -232,26 +253,29 @@ def send_order(uid: str, order: dict) -> None:
             None
         )
         if req_number:
-            print("✅ Номер новой заявки:", req_number)
+            log.info("✅ Номер новой заявки: %s", req_number)
         else:
-            print("== /ws result debug ==", json.dumps(result, ensure_ascii=False, indent=2))
-            print("⚠ Заявка создана, но номер вернуть не удалось (проверьте логи 1С).")
+            log.warning("== /ws result debug ==\n%s",
+                        json.dumps(result, ensure_ascii=False, indent=2))
+            log.warning("⚠ Заявка создана, но номер вернуть не удалось (проверьте логи 1С).")
     except requests.RequestException as err:
-        print("⚠ Заявка создана, но не удалось узнать номер:", err)
+        log.error("⚠ Заявка создана, но не удалось узнать номер: %s", err)
 
 # ────────────────────────────────────────────────────────────────
 def main():
     # читаем данные JSON из stdin
     raw_json = sys.stdin.read().strip()
     if not raw_json:
-        print("Нет входных данных.")
+        log.error("Нет входных данных.")
         return
 
     try:
         client = json.loads(raw_json)
     except json.JSONDecodeError as e:
-        print("Неверный JSON:", e)
+        log.error("Неверный JSON: %s", e)
         return
+    
+    log.info("Получены данные клиента: %s", raw_json)
 
     # 1) записываем в текстовый файл
     save_to_txt(client)
@@ -263,3 +287,4 @@ def main():
 # ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
+
