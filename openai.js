@@ -9,20 +9,26 @@ logger.info('Loading openai.js module');
 
 //-----------------------------
 const { DateTime } = require("luxon");
-require("dotenv").config();
-
 const TZ = "Europe/Moscow";
-const now = DateTime.now().setZone(TZ);
-const nowDateISO = now.toISODate();
-const nowWeekday = now.setLocale("ru").toFormat("cccc");
-const baseSystemPrompt = process.env.SYSTEM_PROMPT;
 
-// объединяем: сначала "дату", потом основной промпт
-const systemPromptFinal = [
-  `Сегодня: ${nowDateISO} (${nowWeekday}). Текущий часовой пояс: ${TZ}.`,
-  `Если клиент говорит "сегодня", "завтра", "послезавтра" или относительные выражения — вычисли конкретную дату в формате YYYY-MM-DD относительно ${nowDateISO}.`,
-  baseSystemPrompt
-].join("\n\n");
+function buildSystemPromptFinal() {
+  const now = DateTime.now().setZone(TZ);
+  const nowDateISO = now.toISODate();
+  const nowWeekday = now.setLocale("ru").toFormat("cccc");
+  const baseSystemPrompt = process.env.SYSTEM_PROMPT;
+  return [
+    `Сегодня: ${nowDateISO} (${nowWeekday}). Текущий часовой пояс: ${TZ}.`,
+    `Если клиент говорит "сегодня", "завтра", "послезавтра" или относительные выражения — вычисли конкретную дату в формате YYYY-MM-DD относительно ${nowDateISO}.`,
+    `ВАЖНО: при озвучивании даты говори её словами по-русски (пример: 2025-12-16 → "16 декабря 2025 года"), но в вызовах инструментов (например save_client_info) используй формат YYYY-MM-DD.`,
+    baseSystemPrompt
+  ].join("\n\n");}
+
+function formatRuDateSpeech(iso) {
+  if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(String(iso))) return iso;
+  return DateTime.fromISO(String(iso), { zone: TZ })
+    .setLocale("ru")
+    .toFormat("d LLLL");
+}
 //-----------------------------
 // --- Correction detector ---
 const CORRECTION_PATTERNS = [
@@ -104,7 +110,7 @@ const REPAIRABLE_TOOLS = {
   },
 };
 
-async function triggerSelfRepair(ws, channelId, toolName, currArgs, reason) {
+async function triggerSelfRepair(ws, channelId, toolName, currArgs, reason, enqueueResponseCreate) {
   const cfg = REPAIRABLE_TOOLS[toolName];
   const hint = cfg?.hint || 'Пересобери аргументы по последним репликам и повторно вызови инструмент.';
 
@@ -135,20 +141,25 @@ ${hint}`
     }
   }));
 
-  ws.send(JSON.stringify({
-    type: 'response.create',
-    response: {
-      modalities: ['audio','text'],
+  if (typeof enqueueResponseCreate === 'function') {
+    enqueueResponseCreate({
+      modalities: ['audio', 'text'],
       instructions: `Выполни переразбор последних реплик и повторно вызови ${toolName} уже с исправленными аргументами.`,
-    }
-  }));
-}
+    });
+  } else {
+    ws.send(JSON.stringify({
+      type: 'response.create',
+      response: {
+        modalities: ['audio','text'],
+        instructions: `Выполни переразбор последних реплик и повторно вызови ${toolName} уже с исправленными аргументами.`,
+      }
+    }));
+  }
+} 
 
-function sendFunctionResult(ws, call_id, outputText) {
-  // output должен быть СТРОКОЙ
+function sendFunctionResult(ws, call_id, outputText, enqueueResponseCreate, opts = {}) {
   const out = (typeof outputText === 'string') ? outputText : JSON.stringify(outputText);
 
-  // 1) кладём вывод функции в беседу
   ws.send(JSON.stringify({
     type: 'conversation.item.create',
     item: {
@@ -158,12 +169,20 @@ function sendFunctionResult(ws, call_id, outputText) {
     }
   }));
 
-  // 2) просим ассистента продолжить (обязательно!)
-  ws.send(JSON.stringify({
-    type: 'response.create',
-    response: { modalities: ['audio','text'] }
-  }));
+  const createResponse = (opts.createResponse !== false);
+
+  if (createResponse) {
+    if (typeof enqueueResponseCreate === 'function') {
+      enqueueResponseCreate({ modalities: ['audio', 'text'] });
+    } else {
+      ws.send(JSON.stringify({
+        type: 'response.create',
+        response: { modalities: ['audio','text'] }
+      }));
+    }
+  }
 }
+
 
 // Асинхронная обработка вызова функции validateRussianPhone
 function validateRussianPhone(raw) {
@@ -221,7 +240,7 @@ async function handleValidatePhone(call, ws, logger) {
         response: {
           modalities: ['audio', 'text'],
           instructions: `Скажи ровно: "Похоже, номер телефона некорректен. Пожалуйста, повторите номер полностью, начиная с +7."`,
-          temperature: 0.6
+          temperature: 0.8
         }
       }));
     }
@@ -233,7 +252,7 @@ async function handleValidatePhone(call, ws, logger) {
         response: {
           modalities: ['audio', 'text'],
           instructions: `Скажи ровно: "Я записала номер ${formattedPhone}. Всё верно?`,
-          temperature: 0.6
+          temperature: 0.8
         }
       }));
     }
@@ -426,6 +445,68 @@ function pushTranscript(role, text) {
   if (transcriptWindow.length > 10) transcriptWindow.shift();
 }
 
+  // ─────────────────────────────────────────────
+  // response.create queue (anti "active response")
+  const RESPONSE_MIN_INTERVAL_MS = 200;
+  let lastResponseCreateAt = 0;
+
+  // Очередь payload-ов (instructions/temperature/etc).
+  const responseCreateQueue = [];
+
+  const canSendNow = () => (
+    ws && ws.readyState === ws.OPEN &&
+    !isResponseActive &&
+    (Date.now() - lastResponseCreateAt) >= RESPONSE_MIN_INTERVAL_MS
+  );
+
+  function _sendResponseCreateNow(payload = {}) {
+    if (!ws || ws.readyState !== ws.OPEN) return;
+
+    isResponseActive = true;
+    lastResponseCreateAt = Date.now();
+
+    ws.send(JSON.stringify({
+      type: 'response.create',
+      response: {
+        modalities: ['audio', 'text'],
+        ...payload,
+      }
+    }));
+  }
+
+  function flushResponseQueue() {
+    if (!ws || ws.readyState !== ws.OPEN) return;
+    if (isResponseActive) return;
+    if (responseCreateQueue.length === 0) return;
+
+    const now = Date.now();
+    const diff = now - lastResponseCreateAt;
+
+    const payload = responseCreateQueue.shift();
+
+    if (diff >= RESPONSE_MIN_INTERVAL_MS) {
+      _sendResponseCreateNow(payload);
+    } else {
+      setTimeout(() => {
+        if (!isResponseActive) _sendResponseCreateNow(payload);
+      }, RESPONSE_MIN_INTERVAL_MS - diff);
+    }
+  }
+
+  function enqueueResponseCreate(payload = {}) {
+    if (!ws || ws.readyState !== ws.OPEN) {
+      responseCreateQueue.push(payload);
+      return;
+    }
+
+    if (canSendNow()) {
+      _sendResponseCreateNow(payload);
+    } else {
+      responseCreateQueue.push(payload);
+    }
+  }
+
+
   const processMessage = async (response) => {
     try {
       switch (response.type) {
@@ -452,9 +533,12 @@ function pushTranscript(role, text) {
           break;
         case 'response.created':
           logOpenAI(`Response created for ${channelId}`);
+          isResponseActive = true;
           break;
         
         case 'response.done': {
+        isResponseActive = false;
+        flushResponseQueue();
         const outputs = response?.response?.output || [];
         for (const out of outputs) {
           if (out.type === 'function_call') {
@@ -472,16 +556,22 @@ function pushTranscript(role, text) {
               // 5.1. если явная «битость» аргументов (пусто/слишком коротко) — не валидируем, а просим саморемонт
               if (toolCfg.looksInvalid && toolCfg.looksInvalid(curr) && retryCount > 0) {
                 logger.warn(`[REPAIR] ${name}: looks invalid -> self-repair (retry=${retryCount})`);
-                await triggerSelfRepair(ws, channelId, name, curr, 'looks_invalid');
-                sendFunctionResult(ws, call_id, JSON.stringify({ ok: false, reason: 'invalid_args' }));
-                continue; // прерываем штатный вызов
+
+                // 1) Сначала пишем function_call_output (без response.create)
+                sendFunctionResult(ws, call_id, JSON.stringify({ ok: false, reason: 'invalid_args' }), enqueueResponseCreate, { createResponse: false });
+
+                // 2) Потом self-repair (он и создаст ОДИН response.create через очередь)
+                await triggerSelfRepair(ws, channelId, name, curr, 'looks_invalid', enqueueResponseCreate);
+
+                continue;
               }
 
-              // 5.2. если аргументы совпадают с предыдущими (залипание) — саморемонт
               if (toolCfg.isSame && toolCfg.isSame(prev, curr) && retryCount > 0) {
                 logger.warn(`[REPAIR] ${name}: same args as previous -> self-repair (retry=${retryCount})`);
-                await triggerSelfRepair(ws, channelId, name, curr, 'same_args');
-                sendFunctionResult(ws, call_id, JSON.stringify({ ok: false, reason: 'same_as_previous' }));
+
+                sendFunctionResult(ws, call_id, JSON.stringify({ ok: false, reason: 'same_as_previous' }), enqueueResponseCreate, { createResponse: false });
+                await triggerSelfRepair(ws, channelId, name, curr, 'same_args', enqueueResponseCreate);
+
                 continue;
               }
 
@@ -508,22 +598,19 @@ function pushTranscript(role, text) {
 
               if (ch.retryCounters.phone >= config.MAX_VALIDATION_RETRIES) {
                 logger.warn(`[PHONE] Max retries reached for ${channelId}, skipping validation`);
-                ws.send(JSON.stringify({
-                  type: 'response.create',
-                  response: {
-                    modalities: ['audio', 'text'],
-                    instructions: 'Кажется, связь плохая. Я записала номер, как вы продиктовали. Если что-то неверно — оператор уточнит при звонке.',
-                    temperature: 0.6
-                  }
-                }));
+                enqueueResponseCreate({
+                  modalities: ['audio', 'text'],
+                  instructions: 'Кажется, связь плохая. Я записала номер, как вы продиктовали. Если что-то неверно — оператор уточнит при звонке.',
+                  temperature: 0.8
+                });
                 ch.retryCounters.phone = 0;
                 sipMap.set(channelId, ch);
 
                 toolResult = JSON.stringify({ ok: true, skipped: true });
-                sendFunctionResult(ws, call_id, toolResult);
+                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
               } else {
                 toolResult = await runValidatePhone(args);
-                sendFunctionResult(ws, call_id, toolResult);
+                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
               }
             }
             else if (name === 'validate_address') {
@@ -536,22 +623,18 @@ function pushTranscript(role, text) {
 
               if (ch.retryCounters.address >= config.MAX_VALIDATION_RETRIES) {
                 logger.warn(`[ADDRESS] Max retries reached for ${channelId}, skipping validation`);
-                ws.send(JSON.stringify({
-                  type: 'response.create',
-                  response: {
-                    modalities: ['audio', 'text'],
-                    instructions: 'Кажется, связь плохая. Я записала адрес, как вы продиктовали. Если что-то неверно — оператор уточнит при звонке.',
-                    temperature: 0.6
-                  }
-                }));
+                enqueueResponseCreate({
+                  instructions: 'Кажется, связь плохая. Я записала адрес, как вы продиктовали. Если что-то неверно — оператор уточнит при звонке.',
+                  temperature: 0.8
+                });
                 ch.retryCounters.address = 0;
                 sipMap.set(channelId, ch);
 
                 toolResult = JSON.stringify({ ok: true, skipped: true });
-                sendFunctionResult(ws, call_id, toolResult);
+                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
               } else {
                 toolResult = await runValidateAddress(args);
-                sendFunctionResult(ws, call_id, toolResult);
+                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
               }
             }
 
@@ -616,18 +699,15 @@ function pushTranscript(role, text) {
                   const addressLine = [addrCore, addrExtras].filter(Boolean).join(' — ');
                   if (addressLine) parts.push(`адрес: ${addressLine}`);
 
-                  if (clientData.date) parts.push(`дата визита: ${clientData.date}`);
+                  if (clientData.date) parts.push(`дата визита: ${formatRuDateSpeech(clientData.date)}`);
                   if (clientData.comment) parts.push(`комментарий: ${clientData.comment}`);
 
                   const summaryText = parts.join('; ');
 
-                  ws.send(JSON.stringify({
-                    type: 'response.create',
-                    response: {
-                      modalities: ['audio','text'],
-                      instructions: `Коротко перечисли: ${summaryText}. В конце спроси: «Подтвердите, всё верно?»`
-                    }
-                  }));
+                  enqueueResponseCreate({
+                    modalities: ['audio','text'],
+                    instructions: `Коротко перечисли: ${summaryText}. В конце спроси: «Подтвердите, всё верно?»`
+                  });
                   return; // не сохраняем, ждём подтверждения
                 }
               }
@@ -635,9 +715,9 @@ function pushTranscript(role, text) {
               try {
                 const orderNum = await runSaveClientInfo(clientData, logger);
                 // вернём как JSON-строку, чтобы модель могла красиво озвучить
-                sendFunctionResult(ws, call_id, JSON.stringify({ ok: true, order_number: orderNum }));
+                sendFunctionResult(ws, call_id, JSON.stringify({ ok: true, order_number: orderNum }), enqueueResponseCreate);
               } catch (e) {
-                sendFunctionResult(ws, call_id, JSON.stringify({ ok: false, error: 'save_failed' }));
+                sendFunctionResult(ws, call_id, JSON.stringify({ ok: false, error: 'save_failed' }), enqueueResponseCreate);
               }
             }
                         // === ЕДИНЫЙ ПОСТ-ОБРАБОТЧИК ДЛЯ phone И address ===
@@ -671,7 +751,8 @@ function pushTranscript(role, text) {
                   if (retry > 0 && REPAIRABLE_TOOLS?.[name]) {
                     const prev = REPAIRABLE_TOOLS[name].takePreviousFromCh(ch);
                     logger.warn(`[REPAIR] ${name}(${slot}): tool returned ok:false on retry=${retry} -> self-repair`);
-                    await triggerSelfRepair(ws, channelId, name, prev || {}, 'fail_result');
+                    await triggerSelfRepair(ws, channelId, name, prev || {}, 'fail_result', enqueueResponseCreate);
+
                   }
                 }
 
@@ -682,6 +763,7 @@ function pushTranscript(role, text) {
             }
           }
         }
+        flushResponseQueue();
         break;
 }
         case 'response.audio.delta':
@@ -753,13 +835,10 @@ function pushTranscript(role, text) {
                       ? 'Прежде чем перейти дальше, пожалуйста, продиктуйте номер ещё раз полностью с +7 — и я проверю.'
                       : 'Прежде чем перейти дальше, давайте уточним адрес: город, улица, дом — я проверю и повторю итог.';
 
-                  ws.send(JSON.stringify({
-                    type: 'response.create',
-                    response: {
-                      modalities: ['audio','text'],
-                      instructions: nudge
-                    }
-                  }));
+                  enqueueResponseCreate({
+                    modalities: ['audio', 'text'],
+                    instructions: nudge
+                  });
                 }
               }
             } else {
@@ -807,13 +886,10 @@ function pushTranscript(role, text) {
 
               // Прерываем текущий ответ ассистента (если говорил) и задаём уточнение
               try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
-              ws.send(JSON.stringify({
-                type: 'response.create',
-                response: {
-                  modalities: ['audio', 'text'],
-                  instructions: ask
-                }
-              }));
+              enqueueResponseCreate({
+                modalities: ['audio', 'text'],
+                instructions: ask
+              });
             }
           }
           break;
@@ -825,11 +901,27 @@ function pushTranscript(role, text) {
           itemRoles.clear();
           lastUserItemId = null;
           responseBuffer = Buffer.alloc(0);
+          flushResponseQueue();
           break;
-        case 'error':
-          logger.error(`OpenAI error for ${channelId}: ${response.error.message}`);
+        case 'error': {
+          const msg = response?.error?.message || '';
+          logger.error(`OpenAI error for ${channelId}: ${msg}`);
+
+          if (msg.includes('Conversation already has an active response')) {
+            // считаем, что ответ всё ещё активен, и просто подождём done/audio.done
+            isResponseActive = true;
+
+            // на всякий случай попробуем позже дёрнуть очередь
+            setTimeout(() => {
+              if (!isResponseActive) flushResponseQueue();
+            }, 300);
+
+            break;
+          }
+
           ws.close();
           break;
+        }
         case "conversation.item.input_audio_transcription.delta":
           logger.debug(`[OpenAI] user speech (partial) for ${channelId}: ${response.delta}`);
           break;
@@ -958,6 +1050,7 @@ const tools = [
 
       ws.on('open', async () => {
         logClient(`OpenAI WebSocket connected for ${channelId}`);
+        const systemPromptFinal = buildSystemPromptFinal();
         ws.send(JSON.stringify({
           type: 'session.update',
           session: {
@@ -977,7 +1070,7 @@ const tools = [
               silence_duration_ms: config.VAD_SILENCE_DURATION_MS || 600
             },
             include: ["item.input_audio_transcription.logprobs"],
-            "temperature": 0.6,
+            "temperature": 0.8,
             tools,
             tool_choice: 'auto'
           }
@@ -1008,14 +1101,11 @@ const tools = [
               content: [{ type: 'input_text', text: config.INITIAL_MESSAGE || 'Hi' }]
             }
           }));
-          ws.send(JSON.stringify({
-            type: 'response.create',
-            response: {
-              modalities: ['audio', 'text'],
-              instructions: systemPromptFinal,
-              output_audio_format: 'g711_ulaw'
-            }
-          }));
+            enqueueResponseCreate({
+                modalities: ['audio', 'text'],
+                instructions: systemPromptFinal,
+                output_audio_format: 'g711_ulaw'
+              });
           logClient(`Requested response for ${channelId}`);
           isResponseActive = true;
           resolve(ws);
