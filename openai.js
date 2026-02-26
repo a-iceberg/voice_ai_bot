@@ -2,8 +2,9 @@ const { parsePhoneNumberFromString } = require('libphonenumber-js');
 const WebSocket = require('ws');
 const { v4: uuid } = require('uuid');
 const { config, logger, logClient, logOpenAI } = require('./config');
-const { sipMap, cleanupPromises } = require('./state');
+const { sipMap, cleanupPromises, extMap } = require('./state');
 const { streamAudio, rtpEvents } = require('./rtp');
+const { handoffToOperator } = require('./asterisk');
 
 logger.info('Loading openai.js module');
 
@@ -581,7 +582,8 @@ function pushTranscript(role, text) {
             }
               let toolResult = null;
 
-            const KNOWN_TOOLS = new Set(['validate_phone','validate_address','save_client_info']);
+            const KNOWN_TOOLS = new Set(['validate_phone','validate_address','save_client_info','transfer_to_operator']);
+
 
             if (!REPAIRABLE_TOOLS[name] && !KNOWN_TOOLS.has(name)) {
               logger.warn(`[TOOLS] Unknown function_call: ${name}`);
@@ -637,7 +639,62 @@ function pushTranscript(role, text) {
                 sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
               }
             }
+            else if (name === 'transfer_to_operator') {
+              const a = (typeof args === 'string') ? JSON.parse(args) : (args || {});
+              const reason = String(a.reason || '').trim();
 
+              logger.info(`[HANDOFF] tool transfer_to_operator called | channel=${channelId} | reason="${reason}"`);
+
+              // 1) ставим флаг, чтобы cleanup не повесил трубку
+              let ch = sipMap.get(channelId) || {};
+              ch.handoffToOperator = true;
+              sipMap.set(channelId, ch);
+
+              // 2) гасим текущую речь модели/плейбек
+              try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+              try { if (ch.streamHandler) ch.streamHandler.stopPlayback(); } catch {}
+
+              // 3) пробуем реально перевести в диалплан
+              try {
+                await handoffToOperator(channelId, { context: 'bot_handoff', exten: '7002', priority: 1 });
+                logger.info(`[HANDOFF] continueInDialplan OK | channel=${channelId} -> bot_handoff,7002,1`);
+
+                // 4) tool output (без response.create)
+                sendFunctionResult(
+                  ws,
+                  call_id,
+                  JSON.stringify({ ok: true, handoff: 'started', target: 'bot_handoff/7002' }),
+                  enqueueResponseCreate,
+                  { createResponse: false }
+                );
+
+                // 5) теперь можно закрыть WS
+                try { ws.close(); } catch {}
+              } catch (e) {
+                logger.error(`[HANDOFF] continueInDialplan FAILED | channel=${channelId} | ${e.message}`);
+
+                // снимаем флаг, чтобы cleanup работал стандартно
+                ch = sipMap.get(channelId) || {};
+                ch.handoffToOperator = false;
+                sipMap.set(channelId, ch);
+
+                // tool output — неуспех
+                sendFunctionResult(
+                  ws,
+                  call_id,
+                  JSON.stringify({ ok: false, error: e.message }),
+                  enqueueResponseCreate
+                );
+
+                // голосом говорим клиенту, что не получилось
+                enqueueResponseCreate({
+                  modalities: ['audio', 'text'],
+                  instructions: 'Не получилось перевести на оператора. Давайте продолжим здесь: что нужно отремонтировать?'
+                });
+              }
+
+              continue;
+            }
             else if (name === 'save_client_info') {
               // args → это JSON с полями заявки (name, direction, phone, address, и т.д.)
               // запускаем ваш Python-скрипт и возвращаем номер заявки
@@ -1043,6 +1100,21 @@ const tools = [
       city:        { type: 'string', description: 'Город' },
       street:      { type: 'string', description: 'Улица' },
       house_number:{ type: 'string', description: 'Дом / корпус / строение' }
+    }
+  }
+},
+{
+  type: 'function',
+  name: 'transfer_to_operator',
+  description: 'Переводит звонок на оператора (в очередь/КЦ). Вызывать, когда по правилам SYSTEM_PROMPT требуется перевод на оператора. После вызова прекрати диалог.',
+  parameters: {
+    type: 'object',
+    required: ['reason'],
+    properties: {
+      reason: {
+        type: 'string',
+        description: 'Одна причина из списка причин перевода из SYSTEM_PROMPT.'
+      }
     }
   }
 }

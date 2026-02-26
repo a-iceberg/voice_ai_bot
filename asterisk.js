@@ -3,7 +3,6 @@ const WebSocket = require('ws');
 const { config, logger } = require('./config');
 const { sipMap, extMap, rtpSenders, rtpReceivers, cleanupPromises } = require('./state');
 const { startRTPReceiver, getNextRtpPort, releaseRtpPort } = require('./rtp');
-const { startOpenAIWebSocket } = require('./openai');
 
 let ariClient;
 
@@ -69,7 +68,10 @@ async function cleanupChannel(channelId) {
           }
         }
       }
-      if (channelData.channel && ariClient) {
+      // Если мы сделали handoff в диалплан — НЕ вешаем трубку клиенту
+      if (channelData.handoffToOperator) {
+        logger.info(`Skip SIP hangup for ${channelId}: handoffToOperator=true`);
+      } else if (channelData.channel && ariClient) {
         try {
           await ariClient.channels.get({ channelId: channelData.channel.id });
           await channelData.channel.hangup();
@@ -211,6 +213,7 @@ async function initializeAriClient() {
           sipMap.set(channel.id, channelData);
         }
 
+        const { startOpenAIWebSocket } = require('./openai'); // лениво, чтобы не было circular dependency
         await startOpenAIWebSocket(channel.id);
       } catch (e) {
         logger.error(`Error in SIP channel ${channel.id}: ${e.message}`);
@@ -270,4 +273,26 @@ async function initializeAriClient() {
   }
 }
 
-module.exports = { initializeAriClient, ariClient };
+async function handoffToOperator(channelId, opts = {}) {
+  if (!ariClient) throw new Error('ARI client is not initialized');
+
+  const context  = opts.context  || 'bot_handoff';
+  const exten    = opts.exten    || '7002';
+  const priority = opts.priority || 1;
+
+  // 1) флаг, чтобы cleanup не повесил трубку
+  const ch = sipMap.get(channelId) || {};
+  ch.handoffToOperator = true;
+  sipMap.set(channelId, ch);
+
+  logger.info(`[HANDOFF] continueInDialplan -> ${context},${exten},${priority} | channel=${channelId}`);
+
+  await ariClient.channels.continueInDialplan({
+    channelId,
+    context,
+    extension: exten,
+    priority,
+  });
+}
+
+module.exports = { initializeAriClient, cleanupChannel, handoffToOperator };
