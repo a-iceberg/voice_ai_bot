@@ -24,6 +24,7 @@ const config = {
   ARI_APP: 'stasis_app',
   OPENAI_API_KEY: auth.OPENAI_API_KEY || process.env.OPENAI_API_KEY,
   REALTIME_URL: `wss://api.openai.com/v1/realtime?model=${process.env.REALTIME_MODEL || 'gpt-4o-mini-realtime-preview-2024-12-17'}`,
+  OPENAI_VOICE: process.env.OPENAI_VOICE || 'alloy',
   RTP_PORT_START: 12000,
   MAX_CONCURRENT_CALLS: parseInt(process.env.MAX_CONCURRENT_CALLS) || 10,
   VAD_THRESHOLD: parseFloat(process.env.VAD_THRESHOLD) || 0.6,
@@ -132,6 +133,7 @@ if (!config.SYSTEM_PROMPT || config.SYSTEM_PROMPT.trim() === '') {
   process.exit(1);
 }
 logger.info('SYSTEM_PROMPT loaded from config.conf');
+logger.info(`OPENAI_VOICE set to: ${config.OPENAI_VOICE}`);
 
 if (config.CALL_DURATION_LIMIT_SECONDS < 0) {
   logger.error('CALL_DURATION_LIMIT_SECONDS cannot be negative in config.conf');
