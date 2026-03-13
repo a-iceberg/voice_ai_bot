@@ -202,14 +202,14 @@ function validateRussianPhone(raw) {
 async function runValidatePhone(args) {
   const a = (typeof args === 'string') ? JSON.parse(args) : args;
   const raw = String(a?.phone ?? '');
-  logger.info(`🔍 [PHONE] Валидация телефона через tools: "${raw}"`);   // +++
+  logger.info(`🔍 [PHONE] Валидация телефона через tools: "${raw}"`); 
 
   const normalized = validateRussianPhone(raw);
   if (!normalized) {
-    logger.warn(`[PHONE] Некорректный телефон: ${raw}`);                // +++
+    logger.warn(`[PHONE] Некорректный телефон: ${raw}`);                
     return JSON.stringify({ ok: false, reason: 'invalid' });
   }
-  logger.info(`[PHONE] Валидный телефон: ${normalized}`);               // +++
+  logger.info(`[PHONE] Валидный телефон: ${normalized}`);               
   return JSON.stringify({ ok: true, normalized });
 }
 async function handleValidatePhone(call, ws, logger) {
@@ -259,7 +259,6 @@ async function handleValidatePhone(call, ws, logger) {
     }
   }
 }
-
 async function runValidateAddress(args) {
   const a = (typeof args === 'string') ? JSON.parse(args) : args;
   const city = String(a?.city || '').trim();
@@ -352,7 +351,22 @@ async function runSaveClientInfo(clientData, logger) {
   });
 }
 
+function formatRuPhoneMasked(normalized) {
+  // ожидаем что normalized типа "+7ХХХХХХХХХХ" или "7ХХХХХХХХХХ"
+  const digits = String(normalized).replace(/\D/g, "");
 
+  // приводим к 11 цифрам, начинающимся на 7
+  let d = digits;
+  if (d.length === 11 && d.startsWith("8")) d = "7" + d.slice(1);
+  if (!(d.length === 11 && d.startsWith("7"))) return null;
+
+  const a = d.slice(1, 4);
+  const b = d.slice(4, 7);
+  const c = d.slice(7, 9);
+  const e = d.slice(9, 11);
+
+  return `+7 ${a} ${b} ${c} ${e}`; // "+7 ХХХ ХХХ ХХ ХХ"
+}
 
 async function waitForBufferEmpty(channelId, maxWaitTime = 6000, checkInterval = 10) {
   const channelData = sipMap.get(channelId);
@@ -609,10 +623,34 @@ function pushTranscript(role, text) {
                 sipMap.set(channelId, ch);
 
                 toolResult = JSON.stringify({ ok: true, skipped: true });
-                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
+                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
               } else {
                 toolResult = await runValidatePhone(args);
-                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
+
+                // не даём модели "самой" строить подтверждение без жёсткого текста
+                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
+
+                let parsed;
+                try { parsed = JSON.parse(toolResult); } catch {}
+
+                if (parsed?.ok && parsed?.normalized) {
+                  const masked = formatRuPhoneMasked(parsed.normalized);
+
+                  // fallback если вдруг не смогли замаскировать
+                  const phoneToSay = masked || String(parsed.normalized);
+
+                  enqueueResponseCreate({
+                    modalities: ["audio", "text"],
+                    temperature: 0.6,
+                    instructions: `Произнеси строго без изменений: Я записала номер телефона ${phoneToSay}. Всё верно?`
+                  });
+                } else {
+                  enqueueResponseCreate({
+                    modalities: ["audio", "text"],
+                    temperature: 0.6,
+                    instructions: `Скажи ровно: "Похоже, номер некорректен. Продиктуйте, пожалуйста, номер полностью, начиная с +7."`
+                  });
+                }
               }
             }
             else if (name === 'validate_address') {
@@ -633,7 +671,7 @@ function pushTranscript(role, text) {
                 sipMap.set(channelId, ch);
 
                 toolResult = JSON.stringify({ ok: true, skipped: true });
-                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
+                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
               } else {
                 toolResult = await runValidateAddress(args);
                 sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
