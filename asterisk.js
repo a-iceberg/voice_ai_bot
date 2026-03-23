@@ -6,6 +6,28 @@ const { startRTPReceiver, getNextRtpPort, releaseRtpPort } = require('./rtp');
 
 let ariClient;
 
+function ensureAriClient() {
+  if (!ariClient) {
+    throw new Error('ARI client is not initialized');
+  }
+
+  return ariClient;
+}
+
+function normalizeEndpoint(target) {
+  const value = String(target || '').trim();
+
+  if (!value) {
+    throw new Error('Target number or endpoint is required');
+  }
+
+  if (value.includes('/')) {
+    return value;
+  }
+
+  return `PJSIP/${value}`;
+}
+
 async function addExtToBridge(client, channel, bridgeId) {
   try {
     const bridge = await client.bridges.get({ bridgeId });
@@ -273,6 +295,33 @@ async function initializeAriClient() {
   }
 }
 
+async function originateBotCall(target, opts = {}) {
+  const client = ensureAriClient();
+  const endpoint = normalizeEndpoint(target);
+  const callerId = String(opts.callerId || '3000').trim();
+  const timeout = Number.isFinite(Number(opts.timeout)) ? Number(opts.timeout) : 30;
+  const variables = {
+    BOT_OUTBOUND_CALL: '1',
+    BOT_TARGET: String(target)
+  };
+
+  logger.info(
+    `Originate bot call requested: callerId=${callerId}, endpoint=${endpoint}, timeout=${timeout}`
+  );
+
+  const channel = await client.channels.originate({
+    endpoint,
+    app: config.ARI_APP,
+    callerId,
+    timeout,
+    formats: 'ulaw',
+    variables
+  });
+
+  logger.info(`Outbound call created: channelId=${channel.id}, endpoint=${endpoint}`);
+  return channel;
+}
+
 async function handoffToOperator(channelId, opts = {}) {
   if (!ariClient) throw new Error('ARI client is not initialized');
 
@@ -295,4 +344,4 @@ async function handoffToOperator(channelId, opts = {}) {
   });
 }
 
-module.exports = { initializeAriClient, cleanupChannel, handoffToOperator };
+module.exports = { initializeAriClient, cleanupChannel, handoffToOperator, originateBotCall };
