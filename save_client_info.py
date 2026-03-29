@@ -80,6 +80,19 @@ def save_to_txt(client: dict) -> None:
         file.write(f"Комментарий: {client.get('comment','')}\n")
         file.write("\n")
 
+def append_client_separator_to_log() -> None:
+    if LOG_PATH.exists() and LOG_PATH.stat().st_size > 0:
+        with open(LOG_PATH, "a", encoding="utf-8") as log_file:
+            log_file.write("-" * 60 + "\n")
+
+def append_order_payload_to_log(payload: dict) -> None:
+    payload_text = json.dumps(payload, indent=2, ensure_ascii=False)
+
+    with open(LOG_PATH, "a", encoding="utf-8") as log_file:
+        log_file.write("ORDER\n")
+        log_file.write(payload_text)
+        log_file.write("\n")
+
 def build_order(client: dict) -> dict:
     """Формируем тело заказа на основе шаблона"""
     order = json.loads(json.dumps(ORDER_TEMPLATE))
@@ -171,10 +184,6 @@ def send_order(uid: str, order: dict) -> None:
 
     payload = {"config": order_data, "params": order, "token": token}
 
-    # сохраняем в файл для отладки
-    with open(ORDER_DIR / f"order_sent_{uid}.json", "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-
     # POST в 1С
     try:
         resp = requests.post(order_url, json=payload, timeout=30, verify=False)
@@ -260,6 +269,8 @@ def send_order(uid: str, order: dict) -> None:
             log.warning("⚠ Заявка создана, но номер вернуть не удалось (проверьте логи 1С).")
     except requests.RequestException as err:
         log.error("⚠ Заявка создана, но не удалось узнать номер: %s", err)
+    finally:
+        append_order_payload_to_log(payload)
 
 # ────────────────────────────────────────────────────────────────
 def main():
@@ -274,7 +285,8 @@ def main():
     except json.JSONDecodeError as e:
         log.error("Неверный JSON: %s", e)
         return
-    
+
+    append_client_separator_to_log()
     log.info("Получены данные клиента: %s", raw_json)
 
     # 1) записываем в текстовый файл
@@ -287,4 +299,3 @@ def main():
 # ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
-
