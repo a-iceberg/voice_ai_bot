@@ -325,8 +325,8 @@ async function originateBotCall(target, opts = {}) {
 async function handoffToOperator(channelId, opts = {}) {
   if (!ariClient) throw new Error('ARI client is not initialized');
 
-  const context  = opts.context  || 'bot_handoff';
-  const exten    = opts.exten    || '7002';
+  const context  = opts.context  || 'from-TRUNK-MSK-RUS';
+  const exten    = opts.exten    || '1200';
   const priority = opts.priority || 1;
 
   // 1) флаг, чтобы cleanup не повесил трубку

@@ -694,14 +694,14 @@ function pushTranscript(role, text) {
 
               // 3) пробуем реально перевести в диалплан
               try {
-                await handoffToOperator(channelId, { context: 'bot_handoff', exten: '7002', priority: 1 });
-                logger.info(`[HANDOFF] continueInDialplan OK | channel=${channelId} -> bot_handoff,7002,1`);
+                await handoffToOperator(channelId, { context: 'from-TRUNK-MSK-RUS', exten: '1200', priority: 1 });
+                logger.info(`[HANDOFF] continueInDialplan OK | channel=${channelId} -> from-TRUNK-MSK-RUS,1200,1`);
 
                 // 4) tool output (без response.create)
                 sendFunctionResult(
                   ws,
                   call_id,
-                  JSON.stringify({ ok: true, handoff: 'started', target: 'bot_handoff/7002' }),
+                  JSON.stringify({ ok: true, handoff: 'started', target: 'from-TRUNK-MSK-RUS/1200' }),
                   enqueueResponseCreate,
                   { createResponse: false }
                 );
