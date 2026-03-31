@@ -1,1 +1,1 @@
-# asterisk-to-openai-realtime-api
+# voice_ai_bot
