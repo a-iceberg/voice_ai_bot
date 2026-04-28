@@ -661,10 +661,10 @@ function pushTranscript(role, text) {
 
               logger.info(`[ADDRESS] function_call attempt ${ch.retryCounters.address}: ${args}`);
 
-              if (ch.retryCounters.address >= config.MAX_VALIDATION_RETRIES) {
+              if (ch.retryCounters.address > config.MAX_VALIDATION_RETRIES) {
                 logger.warn(`[ADDRESS] Max retries reached for ${channelId}, skipping validation`);
                 enqueueResponseCreate({
-                  instructions: 'Хорошо, я записал адрес, как вы продиктовали, проверим в конце. Если что-то неверно — оператор уточнит при звонке.',
+                  instructions: 'Не могу точно определить ваш адрес. Сейчас переведу вас на оператора, ожидайте, пожалуйста, на линии.',
                   temperature: 0.7
                 });
                 ch.retryCounters.address = 0;
