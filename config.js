@@ -23,19 +23,19 @@ const config = {
   ARI_PASS: auth.ARI_PASS || process.env.ARI_PASSWORD || 'asterisk',
   ARI_APP: 'stasis_app',
   OPENAI_API_KEY: auth.OPENAI_API_KEY || process.env.OPENAI_API_KEY,
-  REALTIME_URL: `wss://api.openai.com/v1/realtime?model=${process.env.REALTIME_MODEL || 'gpt-4o-mini-realtime-preview-2024-12-17'}`,
-  OPENAI_VOICE: process.env.OPENAI_VOICE || 'alloy',
+  REALTIME_URL: `wss://api.openai.com/v1/realtime?model=${process.env.REALTIME_MODEL || 'gpt-realtime-1.5'}`,
+  OPENAI_VOICE: process.env.OPENAI_VOICE || 'cedar',
   RTP_PORT_START: 12000,
-  MAX_CONCURRENT_CALLS: parseInt(process.env.MAX_CONCURRENT_CALLS) || 10,
+  MAX_CONCURRENT_CALLS: parseInt(process.env.MAX_CONCURRENT_CALLS) || 20,
   VAD_THRESHOLD: parseFloat(process.env.VAD_THRESHOLD) || 0.6,
   VAD_PREFIX_PADDING_MS: Number(process.env.VAD_PREFIX_PADDING_MS) || 200,
   VAD_SILENCE_DURATION_MS: Number(process.env.VAD_SILENCE_DURATION_MS) || 600,
   LOG_LEVEL: process.env.LOG_LEVEL || 'info',
   SYSTEM_PROMPT: process.env.SYSTEM_PROMPT,
-  INITIAL_MESSAGE: process.env.INITIAL_MESSAGE || 'Hi',
+  INITIAL_MESSAGE: process.env.INITIAL_MESSAGE || 'Здравствуйте! Я голосовой ассистент приема заявок компании Айсберг',
   SILENCE_PADDING_MS: parseInt(process.env.SILENCE_PADDING_MS) || 100,
   CALL_DURATION_LIMIT_SECONDS: parseInt(process.env.CALL_DURATION_LIMIT_SECONDS) || 0, // 0 means no limit
-  MAX_VALIDATION_RETRIES: parseInt(process.env.MAX_VALIDATION_RETRIES) || 3
+  MAX_VALIDATION_RETRIES: parseInt(process.env.MAX_VALIDATION_RETRIES) || 2
 };
 
 let sentEventCounter = 0;

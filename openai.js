@@ -241,7 +241,7 @@ async function handleValidatePhone(call, ws, logger) {
         response: {
           modalities: ['audio', 'text'],
           instructions: `Скажи ровно: "Похоже, номер телефона некорректен. Пожалуйста, повторите номер полностью, начиная с +7."`,
-          temperature: 0.8
+          temperature: 0.6
         }
       }));
     }
@@ -252,8 +252,8 @@ async function handleValidatePhone(call, ws, logger) {
         type: 'response.create',
         response: {
           modalities: ['audio', 'text'],
-          instructions: `Скажи ровно: "Я записала номер ${formattedPhone}. Всё верно?`,
-          temperature: 0.8
+          instructions: `Скажи ровно, произнося точно по одной цифре (например +7 9 0 9 5 6 2 8 4 2 0): "Я записал номер ${formattedPhone}. Всё верно?`,
+          temperature: 0.6
         }
       }));
     }
@@ -616,8 +616,8 @@ function pushTranscript(role, text) {
                 logger.warn(`[PHONE] Max retries reached for ${channelId}, skipping validation`);
                 enqueueResponseCreate({
                   modalities: ['audio', 'text'],
-                  instructions: 'Кажется, связь плохая. Я записала номер, как вы продиктовали. Если что-то неверно — оператор уточнит при звонке.',
-                  temperature: 0.8
+                  instructions: 'Хорошо, я записал номер, как вы продиктовали, проверим в конце. Если что-то неверно — оператор уточнит при звонке.',
+                  temperature: 0.7
                 });
                 ch.retryCounters.phone = 0;
                 sipMap.set(channelId, ch);
@@ -642,7 +642,7 @@ function pushTranscript(role, text) {
                   enqueueResponseCreate({
                     modalities: ["audio", "text"],
                     temperature: 0.6,
-                    instructions: `Произнеси строго без изменений: Я записала номер телефона ${phoneToSay}. Всё верно?`
+                    instructions: `Произнеси строго без изменений, проговаривая точно по одной цифре (например +7 9 0 9 5 6 2 8 4 2 0): Я записал номер телефона ${phoneToSay}. Всё верно?`
                   });
                 } else {
                   enqueueResponseCreate({
@@ -664,8 +664,8 @@ function pushTranscript(role, text) {
               if (ch.retryCounters.address >= config.MAX_VALIDATION_RETRIES) {
                 logger.warn(`[ADDRESS] Max retries reached for ${channelId}, skipping validation`);
                 enqueueResponseCreate({
-                  instructions: 'Кажется, связь плохая. Я записала адрес, как вы продиктовали. Если что-то неверно — оператор уточнит при звонке.',
-                  temperature: 0.8
+                  instructions: 'Хорошо, я записал адрес, как вы продиктовали, проверим в конце. Если что-то неверно — оператор уточнит при звонке.',
+                  temperature: 0.7
                 });
                 ch.retryCounters.address = 0;
                 sipMap.set(channelId, ch);
@@ -801,7 +801,7 @@ function pushTranscript(role, text) {
 
                   enqueueResponseCreate({
                     modalities: ['audio','text'],
-                    instructions: `Коротко перечисли: ${summaryText}. В конце спроси: «Подтвердите, всё верно?»`
+                    instructions: `Коротко перечисли: ${summaryText}. В конце спроси: «Подтвердите, всё верно? Если да, после подтверждения оставайтесь, пожалуйста, на линии - как оформлю заявку, назову вам её номер»`
                   });
                   return; // не сохраняем, ждём подтверждения
                 }
@@ -976,8 +976,8 @@ function pushTranscript(role, text) {
               // Вежливо просим продиктовать заново и обещаем проверить
               const ask =
                 target === 'phone'
-                  ? 'Давайте ещё раз продиктуйте номер полностью, начиная с +7. Я проверю и сразу повторю вам то, что записала.'
-                  : 'Давайте ещё раз: город, улица, дом — продиктуйте пожалуйста полностью. Я проверю адрес и повторю вам итог.';
+                  ? 'Давайте ещё раз продиктуете номер полностью, начиная с +7. Я проверю и сразу повторю вам то, что записал.'
+                  : 'Давайте ещё раз: город, улица, дом — продиктуйте, пожалуйста, полностью. Я проверю адрес и повторю вам итог.';
 
               // Прерываем текущий ответ ассистента (если говорил) и задаём уточнение
               try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
@@ -1165,7 +1165,8 @@ const tools = [
           type: 'session.update',
           session: {
             modalities: ['audio', 'text'],
-            voice: config.OPENAI_VOICE || 'alloy',
+            voice: config.OPENAI_VOICE || 'cedar',
+            speed: 0.95,
             instructions: systemPromptFinal,
             input_audio_format: 'g711_ulaw',
             output_audio_format: 'g711_ulaw',
@@ -1180,7 +1181,7 @@ const tools = [
               silence_duration_ms: config.VAD_SILENCE_DURATION_MS || 600
             },
             include: ["item.input_audio_transcription.logprobs"],
-            "temperature": 0.8,
+            "temperature": 0.7,
             tools,
             tool_choice: 'auto'
           }
@@ -1201,14 +1202,14 @@ const tools = [
           sipMap.set(channelId, channelData);
 
           const itemId = uuid().replace(/-/g, '').substring(0, 32);
-          logClient(`Sending initial message for ${channelId}: ${config.INITIAL_MESSAGE || 'Hi'}`);
+          logClient(`Sending initial message for ${channelId}: ${config.INITIAL_MESSAGE || 'Здравствуйте! Я голосовой ассистент приема заявок компании Айсберг'}`);
           ws.send(JSON.stringify({
             type: 'conversation.item.create',
             item: {
               id: itemId,
               type: 'message',
               role: 'user',
-              content: [{ type: 'input_text', text: config.INITIAL_MESSAGE || 'Hi' }]
+              content: [{ type: 'input_text', text: config.INITIAL_MESSAGE || 'Здравствуйте! Я голосовой ассистент приема заявок компании Айсберг' }]
             }
           }));
             enqueueResponseCreate({
