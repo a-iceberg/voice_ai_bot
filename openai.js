@@ -617,7 +617,7 @@ function pushTranscript(role, text) {
                 enqueueResponseCreate({
                   modalities: ['audio', 'text'],
                   instructions: 'Хорошо, я записал номер, как вы продиктовали, проверим в конце. Если что-то неверно — оператор уточнит при звонке.',
-                  temperature: 0.7
+                  temperature: 0.6
                 });
                 ch.retryCounters.phone = 0;
                 sipMap.set(channelId, ch);
@@ -665,7 +665,7 @@ function pushTranscript(role, text) {
                 logger.warn(`[ADDRESS] Max retries reached for ${channelId}, skipping validation`);
                 enqueueResponseCreate({
                   instructions: 'Не могу точно определить ваш адрес. Сейчас переведу вас на оператора, ожидайте, пожалуйста, на линии.',
-                  temperature: 0.7
+                  temperature: 0.6
                 });
                 ch.retryCounters.address = 0;
                 sipMap.set(channelId, ch);
@@ -1181,7 +1181,7 @@ const tools = [
               silence_duration_ms: config.VAD_SILENCE_DURATION_MS || 600
             },
             include: ["item.input_audio_transcription.logprobs"],
-            "temperature": 0.7,
+            "temperature": 0.6,
             tools,
             tool_choice: 'auto'
           }
