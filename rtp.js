@@ -64,7 +64,7 @@ async function streamAudio(channelId, rtpSource) {
   let rtpTimestamp = 0;
   const rtpSsrc = Math.floor(Math.random() * 4294967295);
   let totalPacketsSent = 0;
-  const maxBufferSize = 640;
+  const maxBufferSize = 1600;
   const samplesPerPacket = 160;
   let lastBufferWarnTime = 0;
   let totalBytesSent = 0;
