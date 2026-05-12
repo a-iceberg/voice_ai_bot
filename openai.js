@@ -12,6 +12,34 @@ logger.info('Loading openai.js module');
 const { DateTime } = require("luxon");
 const TZ = "Europe/Moscow";
 
+// ----------------------------
+// µ-law decode table + silence detector
+const MULAW_DECODE_TABLE = (() => {
+  const t = new Int16Array(256);
+  for (let b = 0; b < 256; b++) {
+    const inv = ~b & 0xFF;
+    const sign = (inv & 0x80) ? -1 : 1;
+    const exponent = (inv >> 4) & 0x07;
+    const mantissa = inv & 0x0F;
+    const sample = ((mantissa << 3) + 0x84) << exponent;
+    t[b] = sign * (sample - 0x84);
+  }
+  return t;
+})();
+
+function isMuLawSilence(buf, rmsThreshold = 100, nearZeroFraction = 0.97) {
+  if (!buf || buf.length === 0) return true;
+  let sumSq = 0;
+  let nearZero = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const sample = MULAW_DECODE_TABLE[buf[i]];
+    sumSq += sample * sample;
+    if (sample > -50 && sample < 50) nearZero++;
+  }
+  const rms = Math.sqrt(sumSq / buf.length);
+  return rms < rmsThreshold || nearZero / buf.length >= nearZeroFraction;
+}
+
 function buildSystemPromptFinal() {
   const now = DateTime.now().setZone(TZ);
   const nowDateISO = now.toISODate();
@@ -390,7 +418,7 @@ async function waitForBufferEmpty(channelId, maxWaitTime = 6000, checkInterval =
       if (id === channelId) {
         logOpenAI(`Audio finished sending for ${channelId} after ${Date.now() - startWaitTime}ms`, 'info');
         audioFinishedReceived = true;
-        resolve();
+        resolve(undefined);
       }
     });
   });
@@ -421,7 +449,7 @@ async function waitForBufferEmpty(channelId, maxWaitTime = 6000, checkInterval =
       if (!audioFinishedReceived) {
         logger.warn(`Timeout waiting for audioFinished for ${channelId} after ${dynamicTimeout}ms`);
       }
-      resolve();
+      resolve(undefined);
     }, dynamicTimeout);
   });
   await Promise.race([audioFinishedPromise, timeoutPromise]);
@@ -760,7 +788,8 @@ function pushTranscript(role, text) {
                   longitude: a.address?.longitude
                 },
                 date: a.date || '',
-                comment: a.comment || ''
+                comment: a.comment || '',
+                multipleRequest: !!(a.multiple_request ?? a.multipleRequest ?? false)
               };
               // --- 🗣️ Чек-лист перед сохранением ---
               const ch = sipMap.get(channelId);
@@ -864,31 +893,34 @@ function pushTranscript(role, text) {
         case 'response.audio.delta':
           if (response.delta) {
             const deltaBuffer = Buffer.from(response.delta, 'base64');
-            if (deltaBuffer.length > 0 && !deltaBuffer.every(byte => byte === 0x7F)) {
-              totalDeltaBytes += deltaBuffer.length;
-              channelData.totalDeltaBytes = totalDeltaBytes; // Store in channelData
-              sipMap.set(channelId, channelData);
-              segmentCount++;
-              if (totalDeltaBytes - loggedDeltaBytes >= 40000 || segmentCount >= 100) {
-                logOpenAI(`Received audio delta for ${channelId}: ${deltaBuffer.length} bytes, total: ${totalDeltaBytes} bytes, estimated duration: ${(totalDeltaBytes / 8000).toFixed(2)}s`, 'info');
-                loggedDeltaBytes = totalDeltaBytes;
-                segmentCount = 0;
-              }
-
-              let packetBuffer = deltaBuffer;
-              if (totalDeltaBytes === deltaBuffer.length) {
-                const silenceDurationMs = config.SILENCE_PADDING_MS || 100;
-                const silencePackets = Math.ceil(silenceDurationMs / 20);
-                const silenceBuffer = Buffer.alloc(silencePackets * 160, 0x7F);
-                packetBuffer = Buffer.concat([silenceBuffer, deltaBuffer]);
-                logger.info(`Prepended ${silencePackets} silence packets (${silenceDurationMs} ms) for ${channelId}`);
-              }
-
-              if (sipMap.has(channelId) && streamHandler) {
-                streamHandler.sendRtpPacket(packetBuffer);
-              }
-            } else {
-              logger.warn(`Received empty or silent delta for ${channelId}`);
+            if (deltaBuffer.length === 0 || isMuLawSilence(deltaBuffer)) {
+              logger.warn(
+                `Dropping silent/empty audio delta for ${channelId}: ${deltaBuffer.length} bytes`
+              );
+              break;
+            }
+            totalDeltaBytes += deltaBuffer.length;
+            channelData.totalDeltaBytes = totalDeltaBytes;
+            sipMap.set(channelId, channelData);
+            segmentCount++;
+            if (totalDeltaBytes - loggedDeltaBytes >= 40000 || segmentCount >= 100) {
+              logOpenAI(
+                `Received audio delta for ${channelId}: ${deltaBuffer.length} bytes, total: ${totalDeltaBytes} bytes, estimated duration: ${(totalDeltaBytes / 8000).toFixed(2)}s`,
+                'info'
+              );
+              loggedDeltaBytes = totalDeltaBytes;
+              segmentCount = 0;
+            }
+            let packetBuffer = deltaBuffer;
+            if (totalDeltaBytes === deltaBuffer.length) {
+              const silenceDurationMs = config.SILENCE_PADDING_MS || 100;
+              const silencePackets = Math.ceil(silenceDurationMs / 20);
+              const silenceBuffer = Buffer.alloc(silencePackets * 160, 0x7F);
+              packetBuffer = Buffer.concat([silenceBuffer, deltaBuffer]);
+              logger.info(`Prepended ${silencePackets} silence packets (${silenceDurationMs} ms) for ${channelId}`);
+            }
+            if (sipMap.has(channelId) && streamHandler) {
+              streamHandler.sendRtpPacket(packetBuffer);
             }
           }
           break;
@@ -988,15 +1020,20 @@ function pushTranscript(role, text) {
             }
           }
           break;
-        case 'response.audio.done':
-          logOpenAI(`Response audio done for ${channelId}, total delta bytes: ${totalDeltaBytes}, estimated duration: ${(totalDeltaBytes / 8000).toFixed(2)}s`, 'info');
-          isResponseActive = false;
-          loggedDeltaBytes = 0;
-          segmentCount = 0;
-          itemRoles.clear();
-          lastUserItemId = null;
-          responseBuffer = Buffer.alloc(0);
-          flushResponseQueue();
+          case 'response.audio.done':
+            logOpenAI(
+              `Response audio done for ${channelId}, total delta bytes: ${totalDeltaBytes}, estimated duration: ${(totalDeltaBytes / 8000).toFixed(2)}s`,
+              'info'
+            );
+            isResponseActive = false;
+            loggedDeltaBytes = 0;
+            segmentCount = 0;
+            totalDeltaBytes = 0;
+            if (channelData) channelData.totalDeltaBytes = 0;
+            itemRoles.clear();
+            lastUserItemId = null;
+            responseBuffer = Buffer.alloc(0);
+            flushResponseQueue();
           break;
         case 'error': {
           const msg = response?.error?.message || '';
@@ -1108,7 +1145,8 @@ const tools = [
           }
         },
         date:   { type: 'string', description: 'Желаемая дата визита (YYYY-MM-DD). Конвертируй относительные фразы на основе текущей даты из системного сообщения.', pattern: '^\\d{4}-\\d{2}-\\d{2}$' },
-        comment:{ type: 'string', description: 'Дополнительный комментарий' }
+        comment: { type: 'string', description: 'Дополнительный комментарий' },
+        multiple_request: { type: 'boolean', default: false, description: 'True, если клиент говорил о нескольких поломках/единицах ТЕХНИКИ (в том числе в направлении Установка) именно при одинаковом направлении для нескольких отдельных заявок, и False, если есть только единичная заявка для одной единицы техники, или же клиент говорил о разных запросах в рамках одного направления именно уже УСЛУГ' }
       }
     }
   },
@@ -1166,7 +1204,6 @@ const tools = [
           session: {
             modalities: ['audio', 'text'],
             voice: config.OPENAI_VOICE || 'cedar',
-            // speed: 0.95,
             instructions: systemPromptFinal,
             input_audio_format: 'g711_ulaw',
             output_audio_format: 'g711_ulaw',

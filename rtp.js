@@ -8,43 +8,114 @@ logger.info('Loading rtp.js module');
 const usedRtpPorts = new Set();
 const rtpEvents = new EventEmitter();
 
-function getNextRtpPort() {
-  let port = config.RTP_PORT_START;
-  while (usedRtpPorts.has(port)) port += 2;
+function probePort(port, host = '127.0.0.1') {
+  return new Promise((resolve) => {
+    const socket = dgram.createSocket({ type: 'udp4', reuseAddr: false });
+    let done = false;
+    const finish = (free) => {
+      if (done) return;
+      done = true;
+      try { socket.close(); } catch (_) { /* noop */ }
+      resolve(free);
+    };
+    socket.once('error', () => finish(false));
+    socket.once('listening', () => finish(true));
+    try {
+      socket.bind(port, host);
+    } catch (_) {
+      finish(false);
+    }
+  });
+}
+
+async function getNextRtpPort() {
+  const start = config.RTP_PORT_START;
+  const maxScan = Math.max(config.MAX_CONCURRENT_CALLS * 2, 50);
+  let port = start;
+  for (let i = 0; i < maxScan; i++, port += 2) {
+    if (usedRtpPorts.has(port)) continue;
+    const free = await probePort(port);
+    if (free) {
+      usedRtpPorts.add(port);
+      return port;
+    }
+    logger.warn(`Port ${port} is free in registry but busy in OS; marking as used`);
+    usedRtpPorts.add(port);
+  }
   if (usedRtpPorts.size >= config.MAX_CONCURRENT_CALLS) {
     logger.warn('Maximum concurrent calls reached, reusing oldest port');
     const oldestPort = Math.min(...usedRtpPorts);
     usedRtpPorts.delete(oldestPort);
-    return oldestPort;
+    if (await probePort(oldestPort)) {
+      usedRtpPorts.add(oldestPort);
+      return oldestPort;
+    }
   }
-  usedRtpPorts.add(port);
-  return port;
+  throw new Error('No free RTP ports available');
 }
-
 function releaseRtpPort(port) {
   usedRtpPorts.delete(port);
 }
 
 function startRTPReceiver(channelId, port) {
-  const rtpReceiver = dgram.createSocket('udp4');
-  rtpReceiver.isOpen = true;
-  rtpReceivers.set(channelId, rtpReceiver);
-
-  rtpReceiver.on('listening', () => logger.info(`RTP Receiver for ${channelId} listening on 127.0.0.1:${port}`));
-  rtpReceiver.on('message', (msg, rinfo) => {
-    const channelData = sipMap.get(channelId);
-    if (channelData && !channelData.rtpSource) {
-      channelData.rtpSource = { address: rinfo.address, port: rinfo.port };
-      sipMap.set(channelId, channelData);
-      logger.info(`RTP source assigned for ${channelId}: ${rinfo.address}:${rinfo.port}`);
-    }
-    if (channelData && channelData.ws && channelData.ws.readyState === 1) {
-      const muLawData = msg.slice(12);
-      channelData.ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: muLawData.toString('base64') }));
+  return new Promise((resolve, reject) => {
+    const rtpReceiver = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+    rtpReceiver.isOpen = false;
+    let settled = false;
+    rtpReceiver.once('listening', () => {
+      rtpReceiver.isOpen = true;
+      rtpReceivers.set(channelId, rtpReceiver);
+      logger.info(`RTP Receiver for ${channelId} listening on 127.0.0.1:${port}`);
+      if (!settled) {
+        settled = true;
+        resolve(rtpReceiver);
+      }
+    });
+    rtpReceiver.on('message', (msg, rinfo) => {
+      const channelData = sipMap.get(channelId);
+      if (channelData && !channelData.rtpSource) {
+        channelData.rtpSource = { address: rinfo.address, port: rinfo.port };
+        sipMap.set(channelId, channelData);
+        logger.info(`RTP source assigned for ${channelId}: ${rinfo.address}:${rinfo.port}`);
+      }
+      if (channelData && channelData.ws && channelData.ws.readyState === 1) {
+        const muLawData = msg.slice(12);
+        channelData.ws.send(JSON.stringify({
+          type: 'input_audio_buffer.append',
+          audio: muLawData.toString('base64')
+        }));
+      }
+    });
+    rtpReceiver.on('error', (err) => {
+      logger.error(`RTP Receiver error for ${channelId}: ${err.message}`);
+      const wasOpen = rtpReceiver.isOpen;
+      rtpReceiver.isOpen = false;
+      try { rtpReceiver.close(); } catch (_) { /* noop */ }
+      rtpReceivers.delete(channelId);
+      releaseRtpPort(port);
+      if (!settled) {
+        settled = true;
+        reject(err);
+        return;
+      }
+      if (wasOpen) {
+        const { cleanupChannel } = require('./asterisk');
+        cleanupChannel(channelId).catch((e) =>
+          logger.error(`Cleanup after RTP receiver error failed for ${channelId}: ${e.message}`)
+        );
+      }
+    });
+    try {
+      rtpReceiver.bind(port, '127.0.0.1');
+    } catch (e) {
+      if (!settled) {
+        settled = true;
+        rtpReceivers.delete(channelId);
+        releaseRtpPort(port);
+        reject(e);
+      }
     }
   });
-  rtpReceiver.on('error', (err) => logger.error(`RTP Receiver error for ${channelId}: ${err.message}`));
-  rtpReceiver.bind(port, '127.0.0.1');
 }
 
 function buildRTPHeader(seq, timestamp, ssrc) {
@@ -64,7 +135,7 @@ async function streamAudio(channelId, rtpSource) {
   let rtpTimestamp = 0;
   const rtpSsrc = Math.floor(Math.random() * 4294967295);
   let totalPacketsSent = 0;
-  const maxBufferSize = 1600;
+  const maxBufferSize = 320;
   const samplesPerPacket = 160;
   let lastBufferWarnTime = 0;
   let totalBytesSent = 0;
@@ -75,7 +146,7 @@ async function streamAudio(channelId, rtpSource) {
   let packetQueue = [];
   let intervalId = null;
 
-  const rtpSender = dgram.createSocket('udp4');
+  const rtpSender = dgram.createSocket({ type: 'udp4', reuseAddr: true });
   rtpSender.isOpen = true;
   rtpSenders.set(channelId, rtpSender);
 
@@ -112,6 +183,25 @@ async function streamAudio(channelId, rtpSource) {
       packetQueue.push({ data: packetData, seq: rtpSequence, timestamp: rtpTimestamp });
       rtpSequence = (rtpSequence + 1) % 65536;
       rtpTimestamp += samplesPerPacket;
+    }
+    const queueSeconds = packetQueue.length * 0.02;
+    if (queueSeconds >= 60) {
+      logger.warn(
+        `RTP queue overflow for ${channelId}: ${packetQueue.length} packets (~${queueSeconds.toFixed(1)}s); dropping playback`
+      );
+      packetQueue = [];
+      if (intervalId) {
+        clearInterval(intervalId);
+        intervalId = null;
+      }
+      rtpEvents.emit('audioFinished', channelId);
+      return;
+    }
+    if (queueSeconds >= 35 && Date.now() - lastBufferWarnTime >= 1000) {
+      logger.warn(
+        `RTP queue is getting large for ${channelId}: ${packetQueue.length} packets (~${queueSeconds.toFixed(1)}s)`
+      );
+      lastBufferWarnTime = Date.now();
     }
     if (!intervalId) {
       processPacketQueue();

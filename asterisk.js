@@ -125,7 +125,7 @@ async function cleanupChannel(channelId) {
           await new Promise((resolve) => {
             sender.close(() => {
               logger.info(`RTP sender socket closed for ${channelId}`);
-              resolve();
+              resolve(undefined);
             });
             setTimeout(resolve, 1000);
           });
@@ -139,7 +139,7 @@ async function cleanupChannel(channelId) {
             receiver.close(() => {
               logger.info(`RTP receiver socket closed for ${channelId}`);
               releaseRtpPort(channelData.rtpPort);
-              resolve();
+              resolve(undefined);
             });
             setTimeout(resolve, 1000);
           });
@@ -196,8 +196,28 @@ async function initializeAriClient() {
         await channel.answer();
         logger.info(`Channel ${channel.id} answered, bridge ${bridgeId} created for SIP audio`);
 
-        const port = getNextRtpPort();
-        await startRTPReceiver(channel.id, port);
+        let port = null;
+        const maxBindAttempts = 3;
+        let lastBindError = null;
+        for (let attempt = 1; attempt <= maxBindAttempts; attempt++) {
+          const candidatePort = await getNextRtpPort();
+          try {
+            await startRTPReceiver(channel.id, candidatePort);
+            port = candidatePort;
+            break;
+          } catch (e) {
+            lastBindError = e;
+            logger.warn(
+              `RTP bind attempt ${attempt}/${maxBindAttempts} on port ${candidatePort} failed for ${channel.id}: ${e.message}`
+            );
+            releaseRtpPort(candidatePort);
+          }
+        }
+        if (port === null) {
+          throw new Error(
+            `Failed to bind RTP receiver after ${maxBindAttempts} attempts: ${lastBindError ? lastBindError.message : 'unknown error'}`
+          );
+        }
         const extParams = {
           app: config.ARI_APP,
           external_host: `127.0.0.1:${port}`,
