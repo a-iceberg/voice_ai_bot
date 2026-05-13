@@ -141,7 +141,7 @@ def build_order(client: dict) -> dict:
     order["order"]["address"]["floor"]     = addr.get("floor", "")
     order["order"]["address"]["intercom"]  = addr.get("intercom", "")
 
-    order["order"]["multipleRequest"]   = bool(client.get("multipleRequest", order["order"].get("multipleRequest", False)))
+    order["order"]["multipleRequest"] = True #bool(client.get("multipleRequest", order["order"].get("multipleRequest", False)))
 
     # name_components: проставляем город
     city = (addr or {}).get("city")
@@ -186,7 +186,7 @@ def send_order(uid: str, order: dict) -> None:
 
     # POST в 1С
     try:
-        resp = requests.post(order_url, json=payload, timeout=30)
+        resp = requests.post(order_url, json=payload, timeout=60)
 
         if resp.status_code >= 400:
             try:
@@ -249,7 +249,7 @@ def send_order(uid: str, order: dict) -> None:
     log.info("[WS] cp=%s | clientPath=%s | ИДЧата=%s", cp, ws_client_path, partner_id)
 
     try:
-        ws_resp = requests.post(ws_url, json=ws_payload, timeout=30)
+        ws_resp = requests.post(ws_url, json=ws_payload, timeout=60)
         if ws_resp.status_code >= 400:
             try:
                 log.error("== Тело ответа /ws ==\n%s", ws_resp.json())
