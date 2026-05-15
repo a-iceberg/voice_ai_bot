@@ -930,49 +930,81 @@ function pushTranscript(role, text) {
             logger.debug(`Full transcript delta message: ${JSON.stringify(response, null, 2)}`);
           }
           break;
-        case 'response.audio_transcript.done':
-          if (response.transcript) {
-            const role = response.item_id && itemRoles.get(response.item_id)
-              ? itemRoles.get(response.item_id)
-              : (lastUserItemId ? 'User' : 'Assistant');
-
-            logger.debug(`Transcript done - Full message: ${JSON.stringify(response, null, 2)}`);
-            const text = response.transcript;
-
-            if (role === 'Assistant') {
-              logOpenAI(`Assistant transcription for ${channelId}: ${text}`, 'info');
-              // --- сохраняем реплику ассистента в историю транскриптов канала ---
-              let ch = sipMap.get(channelId) || {};
-              ch.transcriptWindow = ch.transcriptWindow || [];
-              ch.transcriptWindow.push({ role: 'assistant', text, t: Date.now() });
-              if (ch.transcriptWindow.length > 10) ch.transcriptWindow.shift();
-              sipMap.set(channelId, ch);
-
-              ch = sipMap.get(channelId);
-              if (ch?.slots) {
-                const tryingToSkip = /\bпер(е|е)йд(е|ё)м|дал(е|ё)е\b/i.test(text); // «перейдём», «далее»
-                const unconfirmed = (!ch.slots.phone.validated || !ch.slots.address.validated);
-
-                if (tryingToSkip && unconfirmed) {
-                  // Мягко отменяем и возвращаем на незакрытый слот
-                  try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
-                  const target = !ch.slots.phone.validated ? 'phone' : 'address';
-                  const nudge =
-                    target === 'phone'
-                      ? 'Прежде чем перейти дальше, пожалуйста, продиктуйте номер ещё раз полностью, сейчас именно по одной цифре, начиная с +7 — и я проверю.'
-                      : 'Прежде чем перейти дальше, давайте уточним адрес: город, улица, дом — я проверю и повторю итог.';
-
-                  enqueueResponseCreate({
-                    modalities: ['audio', 'text'],
-                    instructions: nudge
-                  });
+          case 'response.audio_transcript.done':
+            if (response.transcript) {
+              const role = response.item_id && itemRoles.get(response.item_id)
+                ? itemRoles.get(response.item_id)
+                : (lastUserItemId ? 'User' : 'Assistant');
+  
+              logger.debug(`Transcript done - Full message: ${JSON.stringify(response, null, 2)}`);
+              const text = response.transcript;
+  
+              if (role === 'Assistant') {
+                logOpenAI(`Assistant transcription for ${channelId}: ${text}`, 'info');
+                let ch = sipMap.get(channelId) || {};
+                ch.transcriptWindow = ch.transcriptWindow || [];
+                ch.transcriptWindow.push({ role: 'assistant', text, t: Date.now() });
+                if (ch.transcriptWindow.length > 10) ch.transcriptWindow.shift();
+                sipMap.set(channelId, ch);
+  
+                ch = sipMap.get(channelId);
+                if (ch) {
+                  const audioBytes  = ch.lastAudioBytes || 0;
+                  const audioSec    = audioBytes / 8000;
+                  const expectedSec = (text || '').trim().length / 18; // ~18 симв/сек для русского
+                  const tooShort    = audioSec < 1.0 && expectedSec > 5.0;
+                  const retried     = ch.audioRetryCount || 0;
+  
+                  if (tooShort && retried < 1) {
+                    ch.audioRetryCount = retried + 1;
+                    sipMap.set(channelId, ch);
+  
+                    logger.warn(
+                      `[RE-SPEAK] Short audio (${audioSec.toFixed(2)}s) for ` +
+                      `${expectedSec.toFixed(1)}s of transcript on ${channelId}, ` +
+                      `requesting re-speak (attempt ${ch.audioRetryCount})`
+                    );
+  
+                    enqueueResponseCreate({
+                      modalities: ['audio', 'text'],
+                      temperature: 0.6,
+                      instructions:
+                        'Произнеси вслух эту реплику в точности, без изменений и без добавлений, нормальной речью: ' +
+                        `"${text.replace(/"/g, '\\"')}"`
+                    });
+                    break;
+                  }
+  
+                  if (!tooShort && retried) {
+                    ch.audioRetryCount = 0;
+                    sipMap.set(channelId, ch);
+                  }
                 }
+  
+                ch = sipMap.get(channelId);
+                if (ch?.slots) {
+                  const tryingToSkip = /\bпер(е|е)йд(е|ё)м|дал(е|ё)е\b/i.test(text); // «перейдём», «далее»
+                  const unconfirmed = (!ch.slots.phone.validated || !ch.slots.address.validated);
+  
+                  if (tryingToSkip && unconfirmed) {
+                    try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+                    const target = !ch.slots.phone.validated ? 'phone' : 'address';
+                    const nudge =
+                      target === 'phone'
+                        ? 'Прежде чем перейти дальше, пожалуйста, продиктуйте номер ещё раз полностью, сейчас именно по одной цифре, начиная с +7 — и я проверю.'
+                        : 'Прежде чем перейти дальше, давайте уточним адрес: город, улица, дом — я проверю и повторю итог.';
+  
+                    enqueueResponseCreate({
+                      modalities: ['audio', 'text'],
+                      instructions: nudge
+                    });
+                  }
+                }
+              } else {
+                logOpenAI(`User command transcription for ${channelId}: ${text}`, 'info');
               }
-            } else {
-              logOpenAI(`User command transcription for ${channelId}: ${text}`, 'info');
             }
-          }
-          break;
+            break;
         case 'conversation.item.input_audio_transcription.delta':
           if (response.delta) {
             logger.debug(`User transcript delta for ${channelId}: ${response.delta.trim()}`);
@@ -1020,11 +1052,18 @@ function pushTranscript(role, text) {
             }
           }
           break;
-          case 'response.audio.done':
+          case 'response.audio.done': {
+            const audioSec = totalDeltaBytes / 8000;
             logOpenAI(
-              `Response audio done for ${channelId}, total delta bytes: ${totalDeltaBytes}, estimated duration: ${(totalDeltaBytes / 8000).toFixed(2)}s`,
+              `Response audio done for ${channelId}, total delta bytes: ${totalDeltaBytes}, estimated duration: ${audioSec.toFixed(2)}s`,
               'info'
             );
+
+            if (channelData) {
+              channelData.lastAudioBytes = totalDeltaBytes;
+              channelData.lastAudioAt = Date.now();
+            }
+
             isResponseActive = false;
             loggedDeltaBytes = 0;
             segmentCount = 0;
@@ -1034,7 +1073,8 @@ function pushTranscript(role, text) {
             lastUserItemId = null;
             responseBuffer = Buffer.alloc(0);
             flushResponseQueue();
-          break;
+            break;
+          }
         case 'error': {
           const msg = response?.error?.message || '';
           logger.error(`OpenAI error for ${channelId}: ${msg}`);

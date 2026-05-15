@@ -185,7 +185,7 @@ async function streamAudio(channelId, rtpSource) {
       rtpTimestamp += samplesPerPacket;
     }
     const queueSeconds = packetQueue.length * 0.02;
-    if (queueSeconds >= 60) {
+    if (queueSeconds >= 55) {
       logger.warn(
         `RTP queue overflow for ${channelId}: ${packetQueue.length} packets (~${queueSeconds.toFixed(1)}s); dropping playback`
       );
