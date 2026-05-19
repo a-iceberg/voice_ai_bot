@@ -5,8 +5,19 @@ const { config, logger, logClient, logOpenAI } = require('./config');
 const { sipMap, cleanupPromises, extMap } = require('./state');
 const { streamAudio, rtpEvents } = require('./rtp');
 const { handoffToOperator } = require('./asterisk');
+const { findNearestAffilate, classifyZone, cityFromAffilate } = require('./address_zoning');
+const { ProxyAgent, fetch: undiciFetch } = require('undici');
 
 logger.info('Loading openai.js module');
+
+const DD_PROXY_DISPATCHER = config.DD_HTTP_PROXY
+  ? new ProxyAgent(config.DD_HTTP_PROXY)
+  : undefined;
+if (DD_PROXY_DISPATCHER) {
+  logger.info(`[ADDRESS] DaData fetch via proxy: ${config.DD_HTTP_PROXY}`);
+} else {
+  logger.info('[ADDRESS] DaData fetch: direct (no proxy configured)');
+}
 
 //-----------------------------
 const { DateTime } = require("luxon");
@@ -292,55 +303,115 @@ async function runValidateAddress(args) {
   const city = String(a?.city || '').trim();
   const street = String(a?.street || '').trim();
   const house = String(a?.house_number || '').trim();
+  const direction = String(a?.direction || '').trim();
 
-  const query = [city, street, house].filter(Boolean).join(', ');
-  logger.info(`🔍 [ADDRESS] Валидация адреса: "${query}"`);
-  if (!query) {
+  const fullAddress = [city, street, house].filter(Boolean).join(', ');
+  logger.info(`🔍 [ADDRESS] Валидация адреса (DaData): "${fullAddress}", direction="${direction}"`);
+
+  if (!fullAddress) {
     logger.warn(`[ADDRESS] Пустой адрес, валидация не выполнена`);
     return JSON.stringify({ ok: false, reason: 'empty' });
   }
 
+  if (!config.DD_API_KEY) {
+    logger.error(`[ADDRESS] DD_API_KEY отсутствует — DaData недоступен`);
+    return JSON.stringify({ ok: false, reason: 'no_dadata_key' });
+  }
+
+  let suggestions = [];
   try {
-    const url = new URL('https://nominatim.openstreetmap.org/search');
-    url.searchParams.set('q', query);
-    url.searchParams.set('format', 'json');
-    url.searchParams.set('limit', '1');
-    const resp = await fetch(url, {
-      headers: { 'User-Agent': 'IcebergBot/1.0 (asterisk_to_openai_rt)' },
-      timeout: 10000
-    });
+    const resp = await undiciFetch(
+      'https://suggestions.dadata.ru/suggestions/api/4_1/rs/suggest/address',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Authorization': `Token ${config.DD_API_KEY}`,
+        },
+        body: JSON.stringify({ query: fullAddress, count: 5 }),
+        dispatcher: DD_PROXY_DISPATCHER,
+      }
+    );
     if (!resp.ok) {
+      logger.error(`[ADDRESS] DaData HTTP ${resp.status}`);
       return JSON.stringify({ ok: false, reason: `http_${resp.status}` });
     }
-    const data = await resp.json();
-    if (!Array.isArray(data) || data.length === 0) {
-      logger.warn(`[ADDRESS] Адрес не найден: "${query}"`);
-      return JSON.stringify({ ok: false, reason: 'not_found' });
-    }
-
-    const hit = data[0];
-    // извлечём нормализованные части, когда есть
-    const display_name = hit.display_name;
-    const latitude  = Number(hit.lat);
-    const longitude = Number(hit.lon);
-
-    // Пытаемся достать компоненты адреса (иногда приходят в hit.address)
-    let norm = { city, street, house_number: house };
-    if (hit.address) {
-      norm.city         = hit.address.city || hit.address.town || hit.address.village || norm.city;
-      norm.street       = hit.address.road || hit.address.pedestrian || norm.street;
-      norm.house_number = hit.address.house_number || norm.house_number;
-    }
-    logger.info(`[ADDRESS] Валидный адрес: ${display_name} (${latitude}, ${longitude})`);
-    return JSON.stringify({
-      ok: true,
-      normalized: { ...norm, latitude, longitude, display_name }
-    });
+    const json = /** @type {any} */ (await resp.json());
+    suggestions = Array.isArray(json?.suggestions) ? json.suggestions : [];
   } catch (e) {
-    logger.error(`[ADDRESS] Ошибка при валидации: ${e.message}`);
+    logger.error(`[ADDRESS] DaData exception: ${e.message}`);
     return JSON.stringify({ ok: false, reason: 'exception' });
   }
+
+  let pick = null;
+  const seenValues = new Set();
+  for (const loc of suggestions) {
+    const d = loc?.data || {};
+    if (d.fias_level !== '8') continue;
+    if (d.qc_geo !== '0' && d.qc_geo !== '1') continue;
+    const val = loc?.unrestricted_value;
+    if (!val || seenValues.has(val)) continue;
+    seenValues.add(val);
+    pick = loc;
+    break;
+  }
+
+  if (!pick) {
+    logger.warn(`[ADDRESS] DaData: подходящий suggest не найден для "${fullAddress}"`);
+    return JSON.stringify({ ok: false, reason: 'geo_unresolved' });
+  }
+
+  const latitude = Number(pick.data.geo_lat);
+  const longitude = Number(pick.data.geo_lon);
+  const display_name = String(pick.unrestricted_value || fullAddress);
+
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    logger.warn(`[ADDRESS] DaData: координаты невалидны для "${fullAddress}"`);
+    return JSON.stringify({ ok: false, reason: 'geo_unresolved' });
+  }
+
+  const { distance, affilate } = findNearestAffilate(latitude, longitude);
+  const { zone } = classifyZone({ affilate, distance, direction });
+  const localityCity = cityFromAffilate(affilate);
+
+  logger.info(
+    `[ADDRESS] DaData OK: "${display_name}" (${latitude},${longitude}) | nearest=${affilate || 'none'} | dist=${Number.isFinite(distance) ? distance.toFixed(2) : 'inf'}km | direction="${direction}" | zone=${zone}`
+  );
+
+  if (zone === 'out_of_service') {
+    return JSON.stringify({
+      ok: false,
+      reason: 'out_of_service_zone',
+      message:
+        'Указанный клиентом адрес находится вне зоны работы нашей компании. Вежливо донесите это до клиента и прекратите далее оформлять заявку!',
+      normalized: { display_name, latitude, longitude },
+    });
+  }
+
+  const normalized = {
+    city: localityCity,
+    street,
+    house_number: house,
+    latitude,
+    longitude,
+    display_name,
+  };
+
+  if (zone === 'paid') {
+    return JSON.stringify({
+      ok: true,
+      transfer: true,
+      reason: 'paid_zone',
+      message:
+        'Указанный клиентом адрес находится вне зоны бесплатного выезда мастера, звонок был переведен на оператора колл-центра для уточнения условий.',
+      normalized,
+    });
+  }
+
+  return JSON.stringify({ ok: true, normalized });
 }
+
 // Асинхронная обработка вызова функции save_client_info
 // --- save-client-info runner -----------------------------------------------
 const { spawn } = require('child_process');
@@ -682,16 +753,22 @@ function pushTranscript(role, text) {
               }
             }
             else if (name === 'validate_address') {
-              const ch = sipMap.get(channelId);
+              const a = (typeof args === 'string') ? JSON.parse(args) : (args || {});
+              let ch = sipMap.get(channelId) || {};
               ch.retryCounters = ch.retryCounters || { phone: 0, address: 0 };
+
+              if (a.direction) {
+                ch.lastDirection = a.direction;
+              }
               ch.retryCounters.address = (ch.retryCounters.address || 0) + 1;
               sipMap.set(channelId, ch);
 
-              logger.info(`[ADDRESS] function_call attempt ${ch.retryCounters.address}: ${args}`);
+              logger.info(`[ADDRESS] function_call attempt ${ch.retryCounters.address}: ${typeof args === 'string' ? args : JSON.stringify(args)}`);
 
               if (ch.retryCounters.address > config.MAX_VALIDATION_RETRIES) {
                 logger.warn(`[ADDRESS] Max retries reached for ${channelId}, skipping validation`);
                 enqueueResponseCreate({
+                  modalities: ['audio', 'text'],
                   instructions: 'Не могу точно определить ваш адрес. Сейчас переведу вас на оператора, ожидайте, пожалуйста, на линии.',
                   temperature: 0.6
                 });
@@ -701,8 +778,73 @@ function pushTranscript(role, text) {
                 toolResult = JSON.stringify({ ok: true, skipped: true });
                 sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
               } else {
-                toolResult = await runValidateAddress(args);
-                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
+                if (!a.direction && ch.lastDirection) {
+                  a.direction = ch.lastDirection;
+                }
+
+                toolResult = await runValidateAddress(a);
+
+                let parsed = null;
+                try { parsed = JSON.parse(toolResult); } catch {}
+
+                const isOutOfService = parsed?.reason === 'out_of_service_zone';
+                const isPaidZone = parsed?.ok === true && parsed?.transfer === true && parsed?.reason === 'paid_zone';
+
+                if (isOutOfService || isPaidZone) {
+                  ch = sipMap.get(channelId) || {};
+                  ch.retryCounters = ch.retryCounters || { phone: 0, address: 0 };
+                  ch.retryCounters.address = Math.max(0, (ch.retryCounters.address || 1) - 1);
+                  sipMap.set(channelId, ch);
+                }
+
+                if (isOutOfService) {
+                  logger.info(`[ADDRESS] zone=out_of_service for ${channelId} — оформление прекращается`);
+                  sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
+                  enqueueResponseCreate({
+                    modalities: ['audio', 'text'],
+                    temperature: 0.6,
+                    instructions:
+                      parsed.message ||
+                      'Указанный клиентом адрес находится вне зоны работы нашей компании. Вежливо донесите это до клиента и прекратите далее оформлять заявку.',
+                  });
+                } else if (isPaidZone) {
+                  logger.info(`[ADDRESS] zone=paid for ${channelId} — авто-перевод на оператора`);
+
+                  sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
+                  enqueueResponseCreate({
+                    modalities: ['audio', 'text'],
+                    temperature: 0.6,
+                    instructions:
+                      parsed.message ||
+                      'Адрес вне зоны бесплатного выезда. Скажите клиенту, что переключаете его на оператора колл-центра для уточнения условий, и сразу прекратите диалог.',
+                  });
+
+                  try {
+                    ch = sipMap.get(channelId) || {};
+                    ch.handoffToOperator = true;
+                    sipMap.set(channelId, ch);
+
+                    try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+                    try { if (ch.streamHandler) ch.streamHandler.stopPlayback(); } catch {}
+
+                    await handoffToOperator(channelId, { context: 'from-TRUNK-MSK-RUS', exten: '1200', priority: 1 });
+                    logger.info(`[HANDOFF/PAID_ZONE] continueInDialplan OK | channel=${channelId} -> from-TRUNK-MSK-RUS,1200,1`);
+                    try { ws.close(); } catch {}
+                  } catch (e) {
+                    logger.error(`[HANDOFF/PAID_ZONE] continueInDialplan FAILED | channel=${channelId} | ${e.message}`);
+                    ch = sipMap.get(channelId) || {};
+                    ch.handoffToOperator = false;
+                    sipMap.set(channelId, ch);
+                    enqueueResponseCreate({
+                      modalities: ['audio', 'text'],
+                      instructions: 'Не получилось перевести на оператора. Давайте продолжим здесь: что нужно отремонтировать?',
+                    });
+                  }
+
+                  continue;
+                } else {
+                  sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
+                }
               }
             }
             else if (name === 'transfer_to_operator') {
@@ -952,10 +1094,10 @@ function pushTranscript(role, text) {
                   const audioBytes  = ch.lastAudioBytes || 0;
                   const audioSec    = audioBytes / 8000;
                   const expectedSec = (text || '').trim().length / 18; // ~18 симв/сек для русского
-                  const tooShort    = audioSec < 1.0 && expectedSec > 5.0;
+                  const tooShort    = audioSec < 2.0 && expectedSec > 5.0;
                   const retried     = ch.audioRetryCount || 0;
   
-                  if (tooShort && retried < 1) {
+                  if (tooShort && retried < 2) {
                     ch.audioRetryCount = retried + 1;
                     sipMap.set(channelId, ch);
   
@@ -1206,19 +1348,31 @@ const tools = [
     }
   },
   {
-  type: 'function',
-  name: 'validate_address',
-  description: 'Проверяет адрес через Nominatim (OSM), возвращает нормализованный адрес и координаты.',
-  parameters: {
-    type: 'object',
-    required: ['city','street','house_number'],
-    properties: {
-      city:        { type: 'string', description: 'Город' },
-      street:      { type: 'string', description: 'Улица' },
-      house_number:{ type: 'string', description: 'Дом / корпус / строение' }
+    type: 'function',
+    name: 'validate_address',
+    description: 'Проверяет адрес, рассчитывает удалённость от ближайшего филиала компании и зону обслуживания. Возвращает нормализованный адрес, координаты и решение по зоне (ok / paid_zone / out_of_service_zone).',
+    parameters: {
+      type: 'object',
+      required: ['city','street','house_number'],
+      properties: {
+        city:         { type: 'string', description: 'Город' },
+        street:       { type: 'string', description: 'Улица' },
+        house_number: { type: 'string', description: 'Дом / корпус / строение' },
+        direction: {
+          type: 'string',
+          description: 'Направление заявки, как в save_client_info.direction. Передавай ровно то направление, которое клиент назвал в начале разговора. Нужно для определения зоны выезда мастера.',
+          enum: [
+            'Холодильники','Кондиционеры','Телевизоры','Стиральные машины',
+            'Посудомоечные машины','Швейные машины','Кофемашины','Плиты',
+            'Микроволновки','Вытяжки','Компьютеры','Гаджеты','Промышленный холод',
+            'Газовые колонки','Установка','Пылесосы','Клининг','Дезинсекция',
+            'Натяжные потолки','Мелкобытовой сервис','Ремонт квартир','Сантехника',
+            'Вывоз мусора','Уборка','Электрика','Окна','Вскрытие замков'
+          ]
+        }
+      }
     }
-  }
-},
+  },
 {
   type: 'function',
   name: 'transfer_to_operator',

@@ -16,6 +16,7 @@
     "libphonenumber-js": "^1.12.31",
     "luxon": "^3.7.2",
     "node-udp": "^1.0.5",
+    "undici": "^7.25.0",
     "uuid": "^9.0.0",
     "winston": "^3.18.3",
     "winston-daily-rotate-file": "^5.0.0",
