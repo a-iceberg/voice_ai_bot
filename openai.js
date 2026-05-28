@@ -183,14 +183,14 @@ ${hint}`
 
   if (typeof enqueueResponseCreate === 'function') {
     enqueueResponseCreate({
-      modalities: ['audio', 'text'],
+      output_modalities: ['audio'],
       instructions: `Выполни переразбор последних реплик и повторно вызови ${toolName} уже с исправленными аргументами.`,
     });
   } else {
     ws.send(JSON.stringify({
       type: 'response.create',
       response: {
-        modalities: ['audio','text'],
+        output_modalities: ['audio'],
         instructions: `Выполни переразбор последних реплик и повторно вызови ${toolName} уже с исправленными аргументами.`,
       }
     }));
@@ -213,11 +213,11 @@ function sendFunctionResult(ws, call_id, outputText, enqueueResponseCreate, opts
 
   if (createResponse) {
     if (typeof enqueueResponseCreate === 'function') {
-      enqueueResponseCreate({ modalities: ['audio', 'text'] });
+      enqueueResponseCreate({ output_modalities: ['audio'] });
     } else {
       ws.send(JSON.stringify({
         type: 'response.create',
-        response: { modalities: ['audio','text'] }
+        response: { output_modalities: ['audio'] }
       }));
     }
   }
@@ -278,9 +278,8 @@ async function handleValidatePhone(call, ws, logger) {
       ws.send(JSON.stringify({
         type: 'response.create',
         response: {
-          modalities: ['audio', 'text'],
-          instructions: `Скажи ровно: "Похоже, номер телефона некорректен. Пожалуйста, повторите номер полностью, сейчас именно по одной цифре, начиная с +7."`,
-          temperature: 0.6
+          output_modalities: ['audio'],
+          instructions: `Скажи ровно: "Похоже, номер телефона некорректен. Пожалуйста, повторите номер полностью, сейчас именно по одной цифре, начиная с +7."`
         }
       }));
     }
@@ -290,9 +289,8 @@ async function handleValidatePhone(call, ws, logger) {
       ws.send(JSON.stringify({
         type: 'response.create',
         response: {
-          modalities: ['audio', 'text'],
-          instructions: `Скажи ровно, произнося точно по одной цифре (например +7 9 0 9 5 6 2 8 4 2 0): "Я записал номер ${formattedPhone}. Всё верно?`,
-          temperature: 0.6
+          output_modalities: ['audio'],
+          instructions: `Скажи ровно, произнося точно по одной цифре (например +7 9 0 9 5 6 2 8 4 2 0): "Я записал номер ${formattedPhone}. Всё верно?`
         }
       }));
     }
@@ -375,8 +373,16 @@ async function runValidateAddress(args) {
   const { zone } = classifyZone({ affilate, distance, direction });
   const localityCity = cityFromAffilate(affilate);
 
+  // Реальный город/населённый пункт из ответа DaData — для озвучки клиенту.
+  // localityCity — это «филиальный» город (для маршрутизации заявки в 1С),
+  // он может отличаться от реального (например, «Москва» вместо «Долгопрудный»).
+  const dd = pick.data || {};
+  const spokenCity = String(
+    dd.city || dd.settlement || dd.area || dd.region || city || ''
+  ).trim();
+
   logger.info(
-    `[ADDRESS] DaData OK: "${display_name}" (${latitude},${longitude}) | nearest=${affilate || 'none'} | dist=${Number.isFinite(distance) ? distance.toFixed(2) : 'inf'}km | direction="${direction}" | zone=${zone}`
+    `[ADDRESS] DaData OK: "${display_name}" (${latitude},${longitude}) | nearest=${affilate || 'none'} | dist=${Number.isFinite(distance) ? distance.toFixed(2) : 'inf'}km | direction="${direction}" | zone=${zone} | spoken_city="${spokenCity}"`
   );
 
   if (zone === 'out_of_service') {
@@ -385,12 +391,13 @@ async function runValidateAddress(args) {
       reason: 'out_of_service_zone',
       message:
         'Указанный клиентом адрес находится вне зоны работы нашей компании. Вежливо донесите это до клиента и прекратите далее оформлять заявку!',
-      normalized: { display_name, latitude, longitude },
+      normalized: { display_name, latitude, longitude, spoken_city: spokenCity },
     });
   }
 
   const normalized = {
-    city: localityCity,
+    city: localityCity,        // системный/филиальный город (идёт в save_client_info → 1С)
+    spoken_city: spokenCity,   // реальный город из DaData (только для озвучки клиенту)
     street,
     house_number: house,
     latitude,
@@ -582,7 +589,7 @@ function pushTranscript(role, text) {
     ws.send(JSON.stringify({
       type: 'response.create',
       response: {
-        modalities: ['audio', 'text'],
+        output_modalities: ['audio'],
         ...payload,
       }
     }));
@@ -630,8 +637,8 @@ function pushTranscript(role, text) {
         case 'session.updated':
           logOpenAI(`Session updated for ${channelId}`);
           break;
-        case 'conversation.item.created':
-          logOpenAI(`Conversation item created for ${channelId}`);
+        case 'conversation.item.added':
+          logOpenAI(`Conversation item added for ${channelId}`);
           if (response.item && response.item.id && response.item.role) {
             logger.debug(`Item created: id=${response.item.id}, role=${response.item.role} for ${channelId}`);
             itemRoles.set(response.item.id, response.item.role);
@@ -714,9 +721,8 @@ function pushTranscript(role, text) {
               if (ch.retryCounters.phone >= config.MAX_VALIDATION_RETRIES) {
                 logger.warn(`[PHONE] Max retries reached for ${channelId}, skipping validation`);
                 enqueueResponseCreate({
-                  modalities: ['audio', 'text'],
-                  instructions: 'Хорошо, я записал номер, как вы продиктовали, проверим в конце. Если что-то неверно — оператор уточнит при звонке.',
-                  temperature: 0.6
+                  output_modalities: ['audio'],
+                  instructions: 'Хорошо, я записал номер, как вы продиктовали, проверим в конце. Если что-то неверно — оператор уточнит при звонке.'
                 });
                 ch.retryCounters.phone = 0;
                 sipMap.set(channelId, ch);
@@ -739,14 +745,12 @@ function pushTranscript(role, text) {
                   const phoneToSay = masked || String(parsed.normalized);
 
                   enqueueResponseCreate({
-                    modalities: ["audio", "text"],
-                    temperature: 0.6,
+                    output_modalities: ['audio'],
                     instructions: `Произнеси строго без изменений, проговаривая точно по одной цифре (например +7 9 0 9 5 6 2 8 4 2 0): Я записал номер телефона ${phoneToSay}. Всё верно?`
                   });
                 } else {
                   enqueueResponseCreate({
-                    modalities: ["audio", "text"],
-                    temperature: 0.6,
+                    output_modalities: ['audio'],
                     instructions: `Скажи ровно: "Похоже, номер некорректен. Продиктуйте, пожалуйста, номер полностью, сейчас именно по одной цифре, начиная с +7."`
                   });
                 }
@@ -768,9 +772,8 @@ function pushTranscript(role, text) {
               if (ch.retryCounters.address > config.MAX_VALIDATION_RETRIES) {
                 logger.warn(`[ADDRESS] Max retries reached for ${channelId}, skipping validation`);
                 enqueueResponseCreate({
-                  modalities: ['audio', 'text'],
-                  instructions: 'Не могу точно определить ваш адрес. Сейчас переведу вас на оператора, ожидайте, пожалуйста, на линии.',
-                  temperature: 0.6
+                  output_modalities: ['audio'],
+                  instructions: 'Не могу точно определить ваш адрес. Сейчас переведу вас на оператора, ожидайте, пожалуйста, на линии.'
                 });
                 ch.retryCounters.address = 0;
                 sipMap.set(channelId, ch);
@@ -801,8 +804,7 @@ function pushTranscript(role, text) {
                   logger.info(`[ADDRESS] zone=out_of_service for ${channelId} — оформление прекращается`);
                   sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
                   enqueueResponseCreate({
-                    modalities: ['audio', 'text'],
-                    temperature: 0.6,
+                    output_modalities: ['audio'],
                     instructions:
                       parsed.message ||
                       'Указанный клиентом адрес находится вне зоны работы нашей компании. Вежливо донесите это до клиента и прекратите далее оформлять заявку.',
@@ -812,8 +814,7 @@ function pushTranscript(role, text) {
 
                   sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
                   enqueueResponseCreate({
-                    modalities: ['audio', 'text'],
-                    temperature: 0.6,
+                    output_modalities: ['audio'],
                     instructions:
                       parsed.message ||
                       'Адрес вне зоны бесплатного выезда. Скажите клиенту, что переключаете его на оператора колл-центра для уточнения условий, и сразу прекратите диалог.',
@@ -836,14 +837,34 @@ function pushTranscript(role, text) {
                     ch.handoffToOperator = false;
                     sipMap.set(channelId, ch);
                     enqueueResponseCreate({
-                      modalities: ['audio', 'text'],
+                      output_modalities: ['audio'],
                       instructions: 'Не получилось перевести на оператора. Давайте продолжим здесь: что нужно отремонтировать?',
                     });
                   }
 
                   continue;
                 } else {
-                  sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
+                  // Не отдаём модели свободу импровизировать подтверждение адреса —
+                  // иначе она произносит системно-филиальный город (normalized.city),
+                  // а не реальный (spoken_city). Сами формируем инструкцию.
+                  sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
+
+                  if (parsed?.ok === true && parsed?.normalized) {
+                    const spoken = parsed.normalized.spoken_city || parsed.normalized.city || '';
+                    const streetN = parsed.normalized.street || '';
+                    const houseN  = parsed.normalized.house_number || '';
+                    const addrLine = [spoken, streetN, houseN].filter(Boolean).join(', ');
+
+                    if (addrLine) {
+                      enqueueResponseCreate({
+                        output_modalities: ['audio'],
+                        temperature: 0.6,
+                        instructions:
+                          `Произнеси клиенту строго следующее, без изменений и без добавлений: ` +
+                          `«Я записал адрес: ${addrLine}. Всё верно?»`
+                      });
+                    }
+                  }
                 }
               }
             }
@@ -896,7 +917,7 @@ function pushTranscript(role, text) {
 
                 // голосом говорим клиенту, что не получилось
                 enqueueResponseCreate({
-                  modalities: ['audio', 'text'],
+                  output_modalities: ['audio'],
                   instructions: 'Не получилось перевести на оператора. Давайте продолжим здесь: что нужно отремонтировать?'
                 });
               }
@@ -948,9 +969,15 @@ function pushTranscript(role, text) {
                   if (clientData.brand) parts.push(`бренд/модель: ${clientData.brand}`);
                   if (clientData.phone) parts.push(`телефон: ${clientData.phone}`);
 
-                  // Адрес (ядро и дополнения)
+                  // Адрес для ОЗВУЧКИ: берём «реальный» город из последнего validate_address
+                  // (например, «Долгопрудный»), а не системно-филиальный (например, «Москва»),
+                  // который пошёл в clientData → 1С.
+                  const spokenCity = ch.lastValidatedAddress?.spoken_city
+                    || clientData.address?.city
+                    || '';
+
                   const addrCore = [
-                    clientData.address?.city,
+                    spokenCity,
                     clientData.address?.street,
                     clientData.address?.house_number
                   ].filter(Boolean).join(', ');
@@ -971,7 +998,7 @@ function pushTranscript(role, text) {
                   const summaryText = parts.join('; ');
 
                   enqueueResponseCreate({
-                    modalities: ['audio','text'],
+                    output_modalities: ['audio'],
                     instructions: `Обязательно спроси: «Подтвердите, всё верно? Если да, после подтверждения оставайтесь, пожалуйста, на линии - назову вам номер заявки, как сейчас оформлю её» и коротко перечисли: ${summaryText}`
                   });
                   return; // не сохраняем, ждём подтверждения
@@ -1004,6 +1031,24 @@ function pushTranscript(role, text) {
                   logger.info(`[LOCK] Slot ${slot} validated=${ch.slots[slot].validated} for ${channelId}`);
                 }
 
+                // 1.1) Запоминаем нормализованный адрес для последующей озвучки —
+                //      нам нужен «реальный» spoken_city из DaData, чтобы в чек-листе
+                //      произнести клиенту его город, а не наш филиальный.
+                if (name === 'validate_address' && parsed.ok === true && parsed.normalized) {
+                  ch = ch || {};
+                  ch.lastValidatedAddress = {
+                    spoken_city:  parsed.normalized.spoken_city || parsed.normalized.city || '',
+                    system_city:  parsed.normalized.city || '',
+                    street:       parsed.normalized.street || '',
+                    house_number: parsed.normalized.house_number || '',
+                    display_name: parsed.normalized.display_name || '',
+                  };
+                  logger.info(
+                    `[ADDRESS] saved spoken_city="${ch.lastValidatedAddress.spoken_city}" ` +
+                    `(system_city="${ch.lastValidatedAddress.system_city}") for ${channelId}`
+                  );
+                }
+
                 // 2) Счётчики ретраев + авто-ремонт
                 const retry = (ch?.retryCounters?.[slot] || 0);
 
@@ -1032,7 +1077,7 @@ function pushTranscript(role, text) {
         flushResponseQueue();
         break;
 }
-        case 'response.audio.delta':
+        case 'response.output_audio.delta':
           if (response.delta) {
             const deltaBuffer = Buffer.from(response.delta, 'base64');
             if (deltaBuffer.length === 0 || isMuLawSilence(deltaBuffer)) {
@@ -1066,13 +1111,13 @@ function pushTranscript(role, text) {
             }
           }
           break;
-        case 'response.audio_transcript.delta':
+        case 'response.output_audio_transcript.delta':
           if (response.delta) {
             logger.debug(`Transcript delta for ${channelId}: ${response.delta.trim()}`);
             logger.debug(`Full transcript delta message: ${JSON.stringify(response, null, 2)}`);
           }
           break;
-          case 'response.audio_transcript.done':
+          case 'response.output_audio_transcript.done':
             if (response.transcript) {
               const role = response.item_id && itemRoles.get(response.item_id)
                 ? itemRoles.get(response.item_id)
@@ -1108,8 +1153,7 @@ function pushTranscript(role, text) {
                     );
   
                     enqueueResponseCreate({
-                      modalities: ['audio', 'text'],
-                      temperature: 0.6,
+                      output_modalities: ['audio'],
                       instructions:
                         'Произнеси вслух эту реплику в точности, без изменений и без добавлений, нормальной речью: ' +
                         `"${text.replace(/"/g, '\\"')}"`
@@ -1137,7 +1181,7 @@ function pushTranscript(role, text) {
                         : 'Прежде чем перейти дальше, давайте уточним адрес: город, улица, дом — я проверю и повторю итог.';
   
                     enqueueResponseCreate({
-                      modalities: ['audio', 'text'],
+                      output_modalities: ['audio'],
                       instructions: nudge
                     });
                   }
@@ -1188,13 +1232,13 @@ function pushTranscript(role, text) {
               // Прерываем текущий ответ ассистента (если говорил) и задаём уточнение
               try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
               enqueueResponseCreate({
-                modalities: ['audio', 'text'],
+                output_modalities: ['audio'],
                 instructions: ask
               });
             }
           }
           break;
-          case 'response.audio.done': {
+          case 'response.output_audio.done': {
             const audioSec = totalDeltaBytes / 8000;
             logOpenAI(
               `Response audio done for ${channelId}, total delta bytes: ${totalDeltaBytes}, estimated duration: ${audioSec.toFixed(2)}s`,
@@ -1258,8 +1302,7 @@ function pushTranscript(role, text) {
     return new Promise((resolve, reject) => {
       ws = new WebSocket(config.REALTIME_URL, {
         headers: {
-          'Authorization': `Bearer ${OPENAI_API_KEY}`,
-          'OpenAI-Beta': 'realtime=v1'
+          'Authorization': `Bearer ${OPENAI_API_KEY}`
         }
       });
 
@@ -1396,23 +1439,30 @@ const tools = [
         ws.send(JSON.stringify({
           type: 'session.update',
           session: {
-            modalities: ['audio', 'text'],
-            voice: config.OPENAI_VOICE || 'cedar',
+            type: 'realtime',
             instructions: systemPromptFinal,
-            input_audio_format: 'g711_ulaw',
-            output_audio_format: 'g711_ulaw',
-            input_audio_transcription: {
-              model: 'gpt-4o-transcribe',
-              language: 'ru'
-            },
-            turn_detection: {
-              type: 'server_vad',
-              threshold: config.VAD_THRESHOLD || 0.6,
-              prefix_padding_ms: config.VAD_PREFIX_PADDING_MS || 200,
-              silence_duration_ms: config.VAD_SILENCE_DURATION_MS || 600
+            output_modalities: ['audio'],
+            audio: {
+              input: {
+                format: { type: 'audio/pcmu' },
+                transcription: {
+                  model: 'gpt-4o-transcribe',
+                  language: 'ru'
+                },
+                turn_detection: {
+                  type: 'server_vad',
+                  threshold: config.VAD_THRESHOLD || 0.6,
+                  prefix_padding_ms: config.VAD_PREFIX_PADDING_MS || 200,
+                  silence_duration_ms: config.VAD_SILENCE_DURATION_MS || 600,
+                  create_response: true
+                }
+              },
+              output: {
+                format: { type: 'audio/pcmu' },
+                voice: config.OPENAI_VOICE || 'cedar'
+              }
             },
             include: ["item.input_audio_transcription.logprobs"],
-            "temperature": 0.6,
             tools,
             tool_choice: 'auto'
           }
@@ -1444,9 +1494,8 @@ const tools = [
             }
           }));
             enqueueResponseCreate({
-                modalities: ['audio', 'text'],
-                instructions: systemPromptFinal,
-                output_audio_format: 'g711_ulaw'
+                output_modalities: ['audio'],
+                instructions: systemPromptFinal
               });
           logClient(`Requested response for ${channelId}`);
           isResponseActive = true;
