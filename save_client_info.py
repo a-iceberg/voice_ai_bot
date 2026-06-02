@@ -63,7 +63,9 @@ def russian_address(addr: dict) -> str:
 
 def save_to_txt(client: dict) -> None:
     """Сохраняем информацию клиента в текстовый файл"""
-    a = client.get("address", {})
+    a = dict(client.get("address", {}) or {})
+    if a.get("spoken_city"):
+        a["city"] = a["spoken_city"]
     with open(BASE_DIR / "clients_info.txt", "a", encoding="utf-8") as file:
         file.write(f"Имя: {client.get('name','')}\n")
         file.write(f"Цель обращения: {client.get('direction','')}\n")
@@ -133,9 +135,15 @@ def build_order(client: dict) -> dict:
     order["order"]["client"]["phone"]        = client.get("phone", "")
     order["order"]["client"]["phoneIncoming"] = client.get("phone2", "")
 
-    # адрес 
-    addr = client.get("address", {})
-    order["order"]["address"]["name"]      = russian_address(addr)
+    # адрес
+    addr = client.get("address", {}) or {}
+    spoken_city = (addr.get("spoken_city") or "").strip()
+    filial_city = (addr.get("city") or "").strip()
+
+    # address.name — реальный адрес клиента (из DaData), не город филиала
+    addr_for_name = dict(addr)
+    addr_for_name["city"] = spoken_city or filial_city
+    order["order"]["address"]["name"]      = russian_address(addr_for_name)
     order["order"]["address"]["apartment"] = addr.get("apartment", "")
     order["order"]["address"]["entrance"]  = addr.get("entrance", "")
     order["order"]["address"]["floor"]     = addr.get("floor", "")
@@ -143,8 +151,8 @@ def build_order(client: dict) -> dict:
 
     order["order"]["multipleRequest"] = True #bool(client.get("multipleRequest", order["order"].get("multipleRequest", False)))
 
-    # name_components: проставляем город
-    city = (addr or {}).get("city")
+    # name_components.locality — только город филиала (для маршрутизации в 1С)
+    city = filial_city
     if city:
         # гарантируем структуру name_components вида [{'kind': 'locality', 'name': <город>}]
         order["order"]["address"].setdefault("name_components", [])

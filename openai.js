@@ -296,6 +296,20 @@ async function handleValidatePhone(call, ws, logger) {
     }
   }
 }
+/** Сохраняет результат validate_address на канале для озвучки (spoken_city) vs 1С (system_city). */
+function applyLastValidatedAddress(ch, normalized) {
+  if (!normalized) return ch;
+  ch = ch || {};
+  ch.lastValidatedAddress = {
+    spoken_city: normalized.spoken_city || normalized.city || '',
+    system_city: normalized.city || '',
+    street: normalized.street || '',
+    house_number: normalized.house_number || '',
+    display_name: normalized.display_name || '',
+  };
+  return ch;
+}
+
 async function runValidateAddress(args) {
   const a = (typeof args === 'string') ? JSON.parse(args) : args;
   const city = String(a?.city || '').trim();
@@ -844,27 +858,15 @@ function pushTranscript(role, text) {
 
                   continue;
                 } else {
-                  // Не отдаём модели свободу импровизировать подтверждение адреса —
-                  // иначе она произносит системно-филиальный город (normalized.city),
-                  // а не реальный (spoken_city). Сами формируем инструкцию.
-                  sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
-
                   if (parsed?.ok === true && parsed?.normalized) {
-                    const spoken = parsed.normalized.spoken_city || parsed.normalized.city || '';
-                    const streetN = parsed.normalized.street || '';
-                    const houseN  = parsed.normalized.house_number || '';
-                    const addrLine = [spoken, streetN, houseN].filter(Boolean).join(', ');
-
-                    if (addrLine) {
-                      enqueueResponseCreate({
-                        output_modalities: ['audio'],
-                        temperature: 0.6,
-                        instructions:
-                          `Произнеси клиенту строго следующее, без изменений и без добавлений: ` +
-                          `«Я записал адрес: ${addrLine}. Всё верно?»`
-                      });
-                    }
+                    ch = applyLastValidatedAddress(ch, parsed.normalized);
+                    sipMap.set(channelId, ch);
+                    logger.info(
+                      `[ADDRESS] saved spoken_city="${ch.lastValidatedAddress.spoken_city}" ` +
+                      `(system_city="${ch.lastValidatedAddress.system_city}") for ${channelId}`
+                    );
                   }
+                  sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
                 }
               }
             }
@@ -932,6 +934,8 @@ function pushTranscript(role, text) {
               // соберём clientData почти как в handleSaveClientInfo
               const channelEntry = Array.from(sipMap.entries()).find(([, data]) => data.ws === ws);
               const callerNumber = channelEntry ? channelEntry[1].callerNumber : null;
+              const chSave = sipMap.get(channelId);
+              const validatedAddr = chSave?.lastValidatedAddress;
               const clientData = {
                 name: a.name,
                 direction: a.direction,
@@ -940,7 +944,12 @@ function pushTranscript(role, text) {
                 phone: String(a.phone),
                 phone2: callerNumber || '',
                 address: {
+                  // city — город филиала для 1С (name_components, маршрутизация)
                   city: a.address?.city,
+                  // spoken_city — реальный НП из DaData для address.name и логов
+                  spoken_city: validatedAddr?.spoken_city
+                    || a.address?.spoken_city
+                    || '',
                   street: a.address?.street,
                   house_number: a.address?.house_number,
                   apartment: a.address?.apartment || '',
@@ -1035,14 +1044,7 @@ function pushTranscript(role, text) {
                 //      нам нужен «реальный» spoken_city из DaData, чтобы в чек-листе
                 //      произнести клиенту его город, а не наш филиальный.
                 if (name === 'validate_address' && parsed.ok === true && parsed.normalized) {
-                  ch = ch || {};
-                  ch.lastValidatedAddress = {
-                    spoken_city:  parsed.normalized.spoken_city || parsed.normalized.city || '',
-                    system_city:  parsed.normalized.city || '',
-                    street:       parsed.normalized.street || '',
-                    house_number: parsed.normalized.house_number || '',
-                    display_name: parsed.normalized.display_name || '',
-                  };
+                  ch = applyLastValidatedAddress(ch, parsed.normalized);
                   logger.info(
                     `[ADDRESS] saved spoken_city="${ch.lastValidatedAddress.spoken_city}" ` +
                     `(system_city="${ch.lastValidatedAddress.system_city}") for ${channelId}`
@@ -1139,7 +1141,7 @@ function pushTranscript(role, text) {
                   const audioBytes  = ch.lastAudioBytes || 0;
                   const audioSec    = audioBytes / 8000;
                   const expectedSec = (text || '').trim().length / 18; // ~18 симв/сек для русского
-                  const tooShort    = audioSec < 2.0 && expectedSec > 5.0;
+                  const tooShort    = audioSec < 3.0 && expectedSec > 5.0;
                   const retried     = ch.audioRetryCount || 0;
   
                   if (tooShort && retried < 2) {
@@ -1358,7 +1360,8 @@ const tools = [
           description: 'Адрес выезда мастера',
           required: ['city', 'street', 'house_number'],
           properties: {
-            city:        { type: 'string', description: 'Город' },
+            city:        { type: 'string', description: 'Город филиала из validate_address.normalized.city (для системы). Не подставляй сюда spoken_city.' },
+            spoken_city: { type: 'string', description: 'Реальный населённый пункт из validate_address.normalized.spoken_city (для address.name в 1С). Если не передаёшь — подставится из последней валидации.' },
             street:      { type: 'string', description: 'Улица' },
             house_number:{ type: 'string', description: 'Дом / корпус / строение' },
             apartment:   { type: 'string', description: 'Квартира' },
@@ -1393,7 +1396,7 @@ const tools = [
   {
     type: 'function',
     name: 'validate_address',
-    description: 'Проверяет адрес, рассчитывает удалённость от ближайшего филиала компании и зону обслуживания. Возвращает нормализованный адрес, координаты и решение по зоне (ok / paid_zone / out_of_service_zone).',
+    description: 'Проверяет адрес, рассчитывает удалённость от ближайшего филиала компании и зону обслуживания. Возвращает нормализованный адрес (в normalized: city — город филиала для save_client_info), street, house_number, координаты и решение по зоне (ok / paid_zone / out_of_service_zone).',
     parameters: {
       type: 'object',
       required: ['city','street','house_number'],
