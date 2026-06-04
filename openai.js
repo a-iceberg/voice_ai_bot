@@ -734,15 +734,16 @@ function pushTranscript(role, text) {
 
               if (ch.retryCounters.phone >= config.MAX_VALIDATION_RETRIES) {
                 logger.warn(`[PHONE] Max retries reached for ${channelId}, skipping validation`);
-                enqueueResponseCreate({
-                  output_modalities: ['audio'],
-                  instructions: 'Хорошо, я записал номер, как вы продиктовали, проверим в конце. Если что-то неверно — оператор уточнит при звонке.'
-                });
                 ch.retryCounters.phone = 0;
                 sipMap.set(channelId, ch);
 
-                toolResult = JSON.stringify({ ok: true, skipped: true });
+                toolResult = JSON.stringify({ ok: true, skipped: true, message: "Превышен лимит переспросов. Не проверяй номер снова. Скажи клиенту: Хорошо, я записал номер, как вы продиктовали, проверим в конце. Если что-то неверно — оператор уточнит при звонке" });
                 sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
+
+                enqueueResponseCreate({
+                  output_modalities: ['audio'],
+                  instructions: 'Скажи ровно: "Хорошо, я записал номер, как вы продиктовали, проверим в конце. Если что-то неверно — оператор уточнит при звонке."'
+                });
               } else {
                 toolResult = await runValidatePhone(args);
 
@@ -1057,7 +1058,11 @@ function pushTranscript(role, text) {
                 if (parsed.ok === true) {
                   if (ch?.retryCounters) {
                     ch.retryCounters[slot] = 0; // сброс счётчика КОНКРЕТНОГО слота
-                    logger.info(`[${slot.toUpperCase()}] ✅ Validation succeeded — retry counter reset for ${channelId}`);
+                    if (parsed.skipped) {
+                      logger.info(`[${slot.toUpperCase()}] Validation skipped (max retries) — retry counter reset for ${channelId}`);
+                    } else {
+                      logger.info(`[${slot.toUpperCase()}] ✅ Validation succeeded — retry counter reset for ${channelId}`);
+                    }
                   }
                 } else {
                   // неуспех -> если это не первая попытка — self-repair
