@@ -964,56 +964,84 @@ function pushTranscript(role, text) {
                 comment: a.comment || '',
                 multipleRequest: !!(a.multiple_request ?? a.multipleRequest ?? false)
               };
-              // --- 🗣️ Чек-лист перед сохранением ---
-              const ch = sipMap.get(channelId);
-              if (ch?.slots) {
-                if (!ch.slots.phone.validated || !ch.slots.address.validated) {
+              // --- 🗣️ Финальное подтверждение перед 1С (всегда наш summary, не импровизация модели) ---
+              let ch = sipMap.get(channelId) || {};
+              if (!ch.saveFinalCheckDone) {
+                if (ch?.slots && (!ch.slots.phone.validated || !ch.slots.address.validated)) {
                   logger.warn(`[CHECKLIST] Слот не подтверждён: phone=${ch.slots.phone.validated}, address=${ch.slots.address.validated}`);
-
-                  // Собираем динамическое краткое резюме из clientData
-                  const parts = [];
-
-                  if (clientData.name) parts.push(`имя: ${clientData.name}`);
-                  if (clientData.direction) parts.push(`цель: ${clientData.direction}`);
-                  if (clientData.circumstances) parts.push(`подробности: ${clientData.circumstances}`);
-                  if (clientData.brand) parts.push(`бренд/модель: ${clientData.brand}`);
-                  if (clientData.phone) parts.push(`телефон: ${clientData.phone}`);
-
-                  // Адрес для ОЗВУЧКИ: берём «реальный» город из последнего validate_address
-                  // (например, «Долгопрудный»), а не системно-филиальный (например, «Москва»),
-                  // который пошёл в clientData → 1С.
-                  const spokenCity = ch.lastValidatedAddress?.spoken_city
-                    || clientData.address?.city
-                    || '';
-
-                  const addrCore = [
-                    spokenCity,
-                    clientData.address?.street,
-                    clientData.address?.house_number
-                  ].filter(Boolean).join(', ');
-
-                  const addrExtras = [
-                    clientData.address?.apartment && `кв ${clientData.address.apartment}`,
-                    clientData.address?.entrance && `подъезд ${clientData.address.entrance}`,
-                    clientData.address?.floor && `этаж ${clientData.address.floor}`,
-                    clientData.address?.intercom && `домофон ${clientData.address.intercom}`
-                  ].filter(Boolean).join(', ');
-
-                  const addressLine = [addrCore, addrExtras].filter(Boolean).join(' — ');
-                  if (addressLine) parts.push(`адрес: ${addressLine}`);
-
-                  if (clientData.date) parts.push(`дата визита: ${formatRuDateSpeech(clientData.date)}`);
-                  if (clientData.comment) parts.push(`комментарий: ${clientData.comment}`);
-
-                  const summaryText = parts.join('; ');
-
-                  enqueueResponseCreate({
-                    output_modalities: ['audio'],
-                    instructions: `Обязательно спроси: «Подтвердите, всё верно? Если да, после подтверждения оставайтесь, пожалуйста, на линии - назову вам номер заявки, как сейчас оформлю её» и коротко перечисли: ${summaryText}`
-                  });
-                  return; // не сохраняем, ждём подтверждения
                 }
+
+                const parts = [];
+                if (clientData.name) parts.push(`имя: ${clientData.name}`);
+                if (clientData.direction) parts.push(`цель: ${clientData.direction}`);
+                if (clientData.circumstances) parts.push(`подробности: ${clientData.circumstances}`);
+                if (clientData.brand) parts.push(`бренд/модель: ${clientData.brand}`);
+
+                const phoneToSay = formatRuPhoneMasked(clientData.phone) || clientData.phone;
+                if (phoneToSay) {
+                  parts.push(
+                    `телефон: ${phoneToSay} (Произнеси номер строго по одной цифре, без изменений)`
+                  );
+                }
+
+                const spokenCity = ch.lastValidatedAddress?.spoken_city
+                  || clientData.address?.spoken_city
+                  || clientData.address?.city
+                  || '';
+
+                const addrCore = [
+                  spokenCity,
+                  clientData.address?.street,
+                  clientData.address?.house_number
+                ].filter(Boolean).join(', ');
+
+                const addrExtras = [
+                  clientData.address?.apartment && `кв ${clientData.address.apartment}`,
+                  clientData.address?.entrance && `подъезд ${clientData.address.entrance}`,
+                  clientData.address?.floor && `этаж ${clientData.address.floor}`,
+                  clientData.address?.intercom && `домофон ${clientData.address.intercom}`
+                ].filter(Boolean).join(', ');
+
+                const addressLine = [addrCore, addrExtras].filter(Boolean).join(' — ');
+                if (addressLine) parts.push(`адрес: ${addressLine}`);
+
+                if (clientData.date) parts.push(`дата визита: ${formatRuDateSpeech(clientData.date)}`);
+                if (clientData.comment) parts.push(`комментарий: ${clientData.comment}`);
+
+                const summaryText = parts.join('; ');
+
+                ch.saveFinalCheckDone = true;
+                sipMap.set(channelId, ch);
+
+                logger.info(`[CHECKLIST] Final confirmation (preview) for ${channelId}: ${summaryText}`);
+
+                sendFunctionResult(
+                  ws,
+                  call_id,
+                  JSON.stringify({
+                    ok: false,
+                    status: 'awaiting_client_confirmation',
+                    message: 'Озвучь сводку клиенту и дождись подтверждения. После «да» снова вызови save_client_info.'
+                  }),
+                  enqueueResponseCreate,
+                  { createResponse: false }
+                );
+
+                enqueueResponseCreate({
+                  output_modalities: ['audio'],
+                  instructions:
+                    `Обязательно спроси: «Подтвердите, всё верно? Если да, после подтверждения оставайтесь, пожалуйста, на линии - назову вам номер заявки, как сейчас оформлю её» ` +
+                    `и коротко перечисли ТОЛЬКО эти данные, без добавлений и без изменений: ${summaryText}`
+                });
+                continue;
               }
+
+              ch.saveFinalCheckDone = false;
+              sipMap.set(channelId, ch);
+
+              logger.info(
+                `[SAVE] Saving final save_client_info args for ${channelId}, phone=${clientData.phone}`
+              );
 
               try {
                 const orderNum = await runSaveClientInfo(clientData, logger);
@@ -1354,7 +1382,7 @@ const tools = [
           ]
         },
         circumstances:{ type: 'string', description: 'Подробности неисправности / обращения' },
-        brand:       { type: 'string',  description: 'Бренд и модель техники одной строкой' },
+        brand:       { type: 'string',  description: 'Бренд и модель ТОЛЬКО если техника, одной строкой' },
         phone: {
   type: 'string',
   description: 'Контактный телефон в формате +7XXXXXXXXXX',
