@@ -735,7 +735,22 @@ function pushTranscript(role, text) {
               if (ch.retryCounters.phone >= config.MAX_VALIDATION_RETRIES) {
                 logger.warn(`[PHONE] Max retries reached for ${channelId}, skipping validation`);
                 ch.retryCounters.phone = 0;
+
+                let phoneForSave = '';
+                try {
+                  const pa = (typeof args === 'string') ? JSON.parse(args) : (args || {});
+                  const rawPhone = String(pa?.phone ?? '');
+                  let digits = rawPhone.replace(/\D/g, '');
+                  if (digits.length === 11 && digits.startsWith('8')) digits = '7' + digits.slice(1);
+                  phoneForSave = (digits.length === 11 && digits.startsWith('7')) ? `+${digits}` : rawPhone;
+                } catch {}
+
+                ch.lastPhoneRaw = phoneForSave;
+                ch.lastValidatedPhone = null;
                 sipMap.set(channelId, ch);
+
+                const phoneToSay = formatRuPhoneMasked(phoneForSave) || phoneForSave;
+                logger.info(`[PHONE] skip: saved lastPhoneRaw="${phoneForSave}" (say="${phoneToSay}") for ${channelId}`);
 
                 toolResult = JSON.stringify({ ok: true, skipped: true, message: "Превышен лимит переспросов. Не проверяй номер снова. Скажи клиенту: Хорошо, я записал номер, как вы продиктовали, проверим в конце. Если что-то неверно — оператор уточнит при звонке" });
                 sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
@@ -755,6 +770,10 @@ function pushTranscript(role, text) {
 
                 if (parsed?.ok && parsed?.normalized) {
                   const masked = formatRuPhoneMasked(parsed.normalized);
+
+                  ch.lastValidatedPhone = parsed.normalized;
+                  ch.lastPhoneRaw = null;
+                  sipMap.set(channelId, ch);
 
                   // fallback если вдруг не смогли замаскировать
                   const phoneToSay = masked || String(parsed.normalized);
@@ -942,7 +961,7 @@ function pushTranscript(role, text) {
                 direction: a.direction,
                 circumstances: a.circumstances || '',
                 brand: a.brand || '',
-                phone: String(a.phone),
+                phone: String(chSave?.lastValidatedPhone || chSave?.lastPhoneRaw || a.phone),
                 phone2: callerNumber || '',
                 address: {
                   // city — город филиала для 1С (name_components, маршрутизация)
@@ -964,83 +983,14 @@ function pushTranscript(role, text) {
                 comment: a.comment || '',
                 multipleRequest: !!(a.multiple_request ?? a.multipleRequest ?? false)
               };
-              // --- 🗣️ Финальное подтверждение перед 1С (всегда наш summary, не импровизация модели) ---
-              let ch = sipMap.get(channelId) || {};
-              if (!ch.saveFinalCheckDone) {
-                if (ch?.slots && (!ch.slots.phone.validated || !ch.slots.address.validated)) {
-                  logger.warn(`[CHECKLIST] Слот не подтверждён: phone=${ch.slots.phone.validated}, address=${ch.slots.address.validated}`);
-                }
-
-                const parts = [];
-                if (clientData.name) parts.push(`имя: ${clientData.name}`);
-                if (clientData.direction) parts.push(`цель: ${clientData.direction}`);
-                if (clientData.circumstances) parts.push(`подробности: ${clientData.circumstances}`);
-                if (clientData.brand) parts.push(`бренд/модель: ${clientData.brand}`);
-
-                const phoneToSay = formatRuPhoneMasked(clientData.phone) || clientData.phone;
-                if (phoneToSay) {
-                  parts.push(
-                    `телефон: ${phoneToSay} (Произнеси номер строго по одной цифре, без изменений)`
-                  );
-                }
-
-                const spokenCity = ch.lastValidatedAddress?.spoken_city
-                  || clientData.address?.spoken_city
-                  || clientData.address?.city
-                  || '';
-
-                const addrCore = [
-                  spokenCity,
-                  clientData.address?.street,
-                  clientData.address?.house_number
-                ].filter(Boolean).join(', ');
-
-                const addrExtras = [
-                  clientData.address?.apartment && `кв ${clientData.address.apartment}`,
-                  clientData.address?.entrance && `подъезд ${clientData.address.entrance}`,
-                  clientData.address?.floor && `этаж ${clientData.address.floor}`,
-                  clientData.address?.intercom && `домофон ${clientData.address.intercom}`
-                ].filter(Boolean).join(', ');
-
-                const addressLine = [addrCore, addrExtras].filter(Boolean).join(' — ');
-                if (addressLine) parts.push(`адрес: ${addressLine}`);
-
-                if (clientData.date) parts.push(`дата визита: ${formatRuDateSpeech(clientData.date)}`);
-                if (clientData.comment) parts.push(`комментарий: ${clientData.comment}`);
-
-                const summaryText = parts.join('; ');
-
-                ch.saveFinalCheckDone = true;
-                sipMap.set(channelId, ch);
-
-                logger.info(`[CHECKLIST] Final confirmation (preview) for ${channelId}: ${summaryText}`);
-
-                sendFunctionResult(
-                  ws,
-                  call_id,
-                  JSON.stringify({
-                    ok: false,
-                    status: 'awaiting_client_confirmation',
-                    message: 'Озвучь сводку клиенту и дождись подтверждения. После «да» снова вызови save_client_info.'
-                  }),
-                  enqueueResponseCreate,
-                  { createResponse: false }
-                );
-
-                enqueueResponseCreate({
-                  output_modalities: ['audio'],
-                  instructions:
-                    `Обязательно спроси: «Подтвердите, всё верно? Если да, после подтверждения оставайтесь, пожалуйста, на линии - назову вам номер заявки, как сейчас оформлю её» ` +
-                    `и коротко перечисли ТОЛЬКО эти данные, без добавлений и без изменений: ${summaryText}`
-                });
-                continue;
+              // Подтверждение делает модель по промпту (одна проверка) — здесь сохраняем напрямую.
+              const ch = sipMap.get(channelId) || {};
+              if (ch?.slots && (!ch.slots.phone.validated || !ch.slots.address.validated)) {
+                logger.warn(`[CHECKLIST] Слот не подтверждён: phone=${ch?.slots?.phone?.validated}, address=${ch?.slots?.address?.validated}`);
               }
 
-              ch.saveFinalCheckDone = false;
-              sipMap.set(channelId, ch);
-
               logger.info(
-                `[SAVE] Saving final save_client_info args for ${channelId}, phone=${clientData.phone}`
+                `[SAVE] Saving save_client_info for ${channelId}, phone=${clientData.phone}`
               );
 
               try {
