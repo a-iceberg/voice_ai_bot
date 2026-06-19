@@ -51,17 +51,33 @@ function isMuLawSilence(buf, rmsThreshold = 100, nearZeroFraction = 0.97) {
   return rms < rmsThreshold || nearZero / buf.length >= nearZeroFraction;
 }
 
+function isOperatorOffHours(dt = DateTime.now().setZone(TZ)) {
+  const h = dt.hour;
+  return h >= 20 || h < 3;
+}
+
+const OPERATOR_OFFHOURS_INSTRUCTION =
+  'Скажи клиенту ровно по смыслу: «Для уточнения дальнейшей информации вы можете позвонить операторам колл-центра с 7 часов утра» и вежливо завершите разговор. НЕ обещай перевод на оператора прямо сейчас.';
+
 function buildSystemPromptFinal() {
   const now = DateTime.now().setZone(TZ);
   const nowDateISO = now.toISODate();
   const nowWeekday = now.setLocale("ru").toFormat("cccc");
-  const baseSystemPrompt = process.env.SYSTEM_PROMPT;
-  return [
-    `Сегодня: ${nowDateISO} (${nowWeekday}). Текущий часовой пояс: ${TZ}.`,
+  const nowTime = now.toFormat("HH:mm");
+  const baseSystemPrompt = process.env.SYSTEM_PROMPT || '';
+  const lines = [
+    `Сегодня: ${nowDateISO} (${nowWeekday}). Текущее время по Москве: ${nowTime}. Текущий часовой пояс: ${TZ}.`,
     `Если клиент говорит "сегодня", "завтра", "послезавтра" или относительные выражения — вычисли конкретную дату в формате YYYY-MM-DD относительно ${nowDateISO}.`,
     `ВАЖНО: при озвучивании даты говори её словами по-русски (пример: 2025-12-16 → "16 декабря 2025 года"), но в вызовах инструментов (например save_client_info) используй формат YYYY-MM-DD.`,
-    baseSystemPrompt
-  ].join("\n\n");}
+  ];
+  if (isOperatorOffHours(now)) {
+    lines.push(
+      'ВАЖНО: сейчас ночное время — операторы колл-центра НЕ работают. НЕ обещай и НЕ выполняй перевод на оператора. Если по правилам потребовался бы перевод на оператора, вместо этого скажи: «Для уточнения дальнейшей информации вы можете позвонить операторам колл-центра с 7 часов утра».'
+    );
+  }
+  lines.push(baseSystemPrompt);
+  return lines.join("\n\n");
+}
 
 function formatRuDateSpeech(iso) {
   if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(String(iso))) return iso;
@@ -844,6 +860,17 @@ function pushTranscript(role, text) {
                       'Указанный клиентом адрес находится вне зоны работы нашей компании. Вежливо донесите это до клиента и прекратите далее оформлять заявку.',
                   });
                 } else if (isPaidZone) {
+                  if (isOperatorOffHours()) {
+                    logger.info(`[ADDRESS] zone=paid + off-hours (МСК) — перевод пропущен | channel=${channelId}`);
+                    sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
+                    enqueueResponseCreate({
+                      output_modalities: ['audio'],
+                      instructions:
+                        'Адрес клиента вне зоны бесплатного выезда мастера. ' + OPERATOR_OFFHOURS_INSTRUCTION
+                    });
+                    continue;
+                  }
+
                   logger.info(`[ADDRESS] zone=paid for ${channelId} — авто-перевод на оператора`);
 
                   sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
@@ -895,6 +922,22 @@ function pushTranscript(role, text) {
               const reason = String(a.reason || '').trim();
 
               logger.info(`[HANDOFF] tool transfer_to_operator called | channel=${channelId} | reason="${reason}"`);
+
+              if (isOperatorOffHours()) {
+                logger.info(`[HANDOFF] off-hours (МСК) — перевод на оператора пропущен | channel=${channelId}`);
+                sendFunctionResult(
+                  ws,
+                  call_id,
+                  JSON.stringify({ ok: true, handoff: 'skipped', reason: 'operator_off_hours' }),
+                  enqueueResponseCreate,
+                  { createResponse: false }
+                );
+                enqueueResponseCreate({
+                  output_modalities: ['audio'],
+                  instructions: OPERATOR_OFFHOURS_INSTRUCTION
+                });
+                continue;
+              }
 
               // 1) ставим флаг, чтобы cleanup не повесил трубку
               let ch = sipMap.get(channelId) || {};
