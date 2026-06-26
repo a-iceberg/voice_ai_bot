@@ -6,26 +6,24 @@
     "server_url": "http://localhost:8081/",
     "proxy_url": "https://service.icecorp.ru:7405",
     "order_path": {
-        "crm": "http://10.2.4.141/Test_CRM/hs/yandex/v1/order/"
+        "crm": "http://10.2.4.123/api/hs/yandex/v1/order/"
     },
     "call_path": {
-        "call": "http://10.2.4.141/Test_CRM/ws/ws1.1cws?wsdl"
+        "call": "http://10.2.4.123/productionCRM/ws/ws1.1cws?wsdl"
     },
     "ws_paths": {
-        "msk": "http://10.2.4.141/Test_CallCentr/ws/OuterQuery?wsdl",
-        "spb": "http://10.2.4.141/Test_Piter_MRM/ws/OuterQuery?wsdl",
-        "reg": "http://10.2.4.141/Test_Region_MRM/ws/OuterQuery?wsdl"
+        "msk": "http://10.2.4.123/productionMSK/ws/OuterQuery?wsdl",
+        "spb": "http://10.2.4.123/productionSPB/ws/OuterQuery?wsdl",
+        "reg": "http://10.2.4.123/productionNNOV/ws/OuterQuery?wsdl"
     },
     "change_path": {
-        "domain": "https://exchange.iceberg.ru/yandex/v1/order/"
-    },
-    "dialogue_path": {
-        "bot_off": "http://msk-srv1cweb04.icecorp.ru/Messenger_Test/hs/BotInform/chat_id/"
+        "domain": "https://partners.iceberg.ru/yandex/v1/order/"
     },
     "photo_path": {
-        "photo": "http://10.2.4.141/Test_CallCentr/hs/addFileToBidPartnerID/"
+        "photo": "https://partners.iceberg.ru/yandex/v1/addFileToBid/"
     },
     "divisions": {
+        "ТЕСТ": "Тестомешалки",
         "ВТ": "Вытяжки",
         "КЛ": "Клининг",
         "ПДМ": "Посудомоечные машины",
