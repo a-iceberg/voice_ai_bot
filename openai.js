@@ -85,6 +85,24 @@ function formatRuDateSpeech(iso) {
     .setLocale("ru")
     .toFormat("d LLLL");
 }
+
+function clientLocalDateInfo(tzStr) {
+  let zone = TZ;
+  const t = String(tzStr || '').trim();
+  if (/^UTC[+-]\d{1,2}(:\d{2})?$/.test(t)) zone = t;
+  let now = DateTime.now().setZone(zone);
+  if (!now.isValid) {
+    zone = TZ;
+    now = DateTime.now().setZone(TZ);
+  }
+  return {
+    zone,
+    nowTime: now.toFormat('HH:mm'),
+    todayISO: now.toISODate() || '',
+    tomorrowISO: now.plus({ days: 1 }).toISODate() || '',
+    withinWorkingHours: now.hour >= 8 && now.hour < 19,
+  };
+}
 //-----------------------------
 // --- Correction detector ---
 const CORRECTION_PATTERNS = [
@@ -129,23 +147,6 @@ function normalizeAddressArgs(obj = {}) {
 const shallowEqualJSON = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
 const REPAIRABLE_TOOLS = {
-  validate_phone: {
-    slot: 'phone',
-    takeCurrent: (args) => {
-      const obj = typeof args === 'string' ? JSON.parse(args) : (args || {});
-      const raw = obj.number ?? obj.phone ?? '';
-      return { raw, normalized: normalizePhoneToE164Like(raw) };
-    },
-    takePreviousFromCh: (ch) => ch.lastToolArgs?.phone ?? null,
-    saveToCh: (ch, curr) => {
-      ch.lastToolArgs = ch.lastToolArgs || {};
-      ch.lastToolArgs.phone = { raw: curr.raw, normalized: curr.normalized };
-    },
-    isSame: (prev, curr) => !!prev && !!curr && prev.normalized && curr.normalized && prev.normalized === curr.normalized,
-    looksInvalid: (curr) => !curr.normalized || curr.normalized.length < 10 || curr.normalized.length > 15,
-    hint: 'Пересобери телефон по последним фразам клиента и вызови validate_phone с корректным номером (не используй старые цифры).',
-  },
-
   validate_address: {
     slot: 'address',
     takeCurrent: (args) => {
@@ -322,6 +323,7 @@ function applyLastValidatedAddress(ch, normalized) {
     street: normalized.street || '',
     house_number: normalized.house_number || '',
     display_name: normalized.display_name || '',
+    timezone: normalized.timezone || '',
   };
   return ch;
 }
@@ -410,6 +412,8 @@ async function runValidateAddress(args) {
   const spokenCity = String(
     dd.city || dd.settlement || dd.area || dd.region || city || ''
   ).trim();
+  // Часовой пояс клиента из DaData (формат вида "UTC+5"); нужен для даты визита по местному времени.
+  const ddTimezone = String(dd.timezone || '').trim();
 
   logger.info(
     `[ADDRESS] DaData OK: "${display_name}" (${latitude},${longitude}) | nearest=${affilate || 'none'} | dist=${Number.isFinite(distance) ? distance.toFixed(2) : 'inf'}km | direction="${direction}" | zone=${zone} | spoken_city="${spokenCity}"`
@@ -433,6 +437,7 @@ async function runValidateAddress(args) {
     latitude,
     longitude,
     display_name,
+    timezone: ddTimezone,      // часовой пояс клиента ("UTC+5") для определения даты визита
   };
 
   if (zone === 'paid') {
@@ -596,6 +601,130 @@ function pushTranscript(role, text) {
   if (transcriptWindow.length > 10) transcriptWindow.shift();
 }
 
+  const SILENCE_GREETING_TIMEOUT_MS = (config.SILENCE_GREETING_TIMEOUT_SEC || 0) * 1000;
+  const SILENCE_CONVO_TIMEOUT_MS = (config.SILENCE_CONVO_TIMEOUT_SEC || 0) * 1000;
+  const SILENCE_CONTINUE_WAIT_MS = (config.SILENCE_CONTINUE_WAIT_SEC || 120) * 1000;
+  const SILENCE_INAUDIBLE_HANGUP_MS = (config.SILENCE_INAUDIBLE_HANGUP_SEC || 5) * 1000;
+  const PHRASE_INAUDIBLE = 'Извините, Вас не слышно, повторите, пожалуйста.';
+  const PHRASE_CONTINUE = 'Вы готовы продолжить диалог?';
+
+  let inactivityTimer = null;
+  let hasClientSpoken = false;
+  let pendingAfterPrompt = null;
+
+  function clearInactivityTimer() {
+    if (inactivityTimer) {
+      clearTimeout(inactivityTimer);
+      inactivityTimer = null;
+    }
+  }
+
+  function armInactivityTimer(ms, fn) {
+    clearInactivityTimer();
+    if (!ms || ms <= 0) return;
+    inactivityTimer = setTimeout(() => {
+      inactivityTimer = null;
+      if (!sipMap.has(channelId)) return;
+      try { fn(); } catch (e) { logger.error(`[SILENCE] timer cb error for ${channelId}: ${e.message}`); }
+    }, ms);
+  }
+
+  function noteClientActivity() {
+    hasClientSpoken = true;
+    pendingAfterPrompt = null;
+    awaitingPlaybackEnd = false;
+    scheduledSilenceAction = null;
+    clearPlaybackFallback();
+    clearInactivityTimer();
+  }
+
+  function speakInactivityPhrase(text) {
+    enqueueResponseCreate({
+      output_modalities: ['audio'],
+      instructions: `Скажи ровно: "${text}"`,
+    });
+  }
+
+  async function dropCallForSilence() {
+    logger.info(`[SILENCE] Клиент молчит — сбрасываю звонок ${channelId}`);
+    clearInactivityTimer();
+    try { if (ws && ws.readyState === ws.OPEN) ws.close(); } catch {}
+    try {
+      const { cleanupChannel } = require('./asterisk');
+      await cleanupChannel(channelId);
+    } catch (e) {
+      logger.error(`[SILENCE] cleanupChannel не удался для ${channelId}: ${e.message}`);
+    }
+  }
+
+  function onSilenceTimeout() {
+    if (!hasClientSpoken) {
+      logger.info(`[SILENCE] Сценарий A: молчание после приветствия для ${channelId} -> "Вас не слышно"`);
+      pendingAfterPrompt = 'arm_hangup';
+      speakInactivityPhrase(PHRASE_INAUDIBLE);
+    } else {
+      logger.info(`[SILENCE] Сценарий B: молчание в диалоге для ${channelId} -> "Готовы продолжить?"`);
+      pendingAfterPrompt = 'arm_continue';
+      speakInactivityPhrase(PHRASE_CONTINUE);
+    }
+  }
+
+  function onContinueTimeout() {
+    logger.info(`[SILENCE] Нет ответа после "Готовы продолжить?" для ${channelId} -> "Вас не слышно"`);
+    pendingAfterPrompt = 'arm_hangup';
+    speakInactivityPhrase(PHRASE_INAUDIBLE);
+  }
+
+  let awaitingPlaybackEnd = false;
+  let scheduledSilenceAction = null;  // 'hangup' | 'continue' | 'silence'
+  let playbackFallbackTimer = null;
+
+  function clearPlaybackFallback() {
+    if (playbackFallbackTimer) {
+      clearTimeout(playbackFallbackTimer);
+      playbackFallbackTimer = null;
+    }
+  }
+
+  function applyScheduledArm() {
+    if (!awaitingPlaybackEnd) return;
+    awaitingPlaybackEnd = false;
+    clearPlaybackFallback();
+    if (!sipMap.has(channelId)) return;
+    const action = scheduledSilenceAction;
+    scheduledSilenceAction = null;
+    if (action === 'hangup') {
+      armInactivityTimer(SILENCE_INAUDIBLE_HANGUP_MS, dropCallForSilence);
+    } else if (action === 'continue') {
+      armInactivityTimer(SILENCE_CONTINUE_WAIT_MS, onContinueTimeout);
+    } else {
+      armInactivityTimer(hasClientSpoken ? SILENCE_CONVO_TIMEOUT_MS : SILENCE_GREETING_TIMEOUT_MS, onSilenceTimeout);
+    }
+  }
+
+  function scheduleInactivityAfterSpeech() {
+    if (pendingAfterPrompt === 'arm_hangup') {
+      pendingAfterPrompt = null;
+      scheduledSilenceAction = 'hangup';
+    } else if (pendingAfterPrompt === 'arm_continue') {
+      pendingAfterPrompt = null;
+      scheduledSilenceAction = 'continue';
+    } else {
+      scheduledSilenceAction = 'silence';
+    }
+    awaitingPlaybackEnd = true;
+    clearInactivityTimer();
+    clearPlaybackFallback();
+    const tailMs = Math.min(((channelData?.lastAudioBytes || 0) / 8000) * 1000 + 1500, 60000);
+    playbackFallbackTimer = setTimeout(applyScheduledArm, Math.max(tailMs, 1500));
+  }
+
+  const onAudioFinishedForSilence = (id) => {
+    if (id !== channelId) return;
+    applyScheduledArm();
+  };
+  rtpEvents.on('audioFinished', onAudioFinishedForSilence);
+
   // ─────────────────────────────────────────────
   // response.create queue (anti "active response")
   const RESPONSE_MIN_INTERVAL_MS = 200;
@@ -667,6 +796,10 @@ function pushTranscript(role, text) {
         case 'session.updated':
           logOpenAI(`Session updated for ${channelId}`);
           break;
+        case 'input_audio_buffer.speech_started':
+          logOpenAI(`Client speech started for ${channelId}`);
+          noteClientActivity();
+          break;
         case 'conversation.item.added':
           logOpenAI(`Conversation item added for ${channelId}`);
           if (response.item && response.item.id && response.item.role) {
@@ -674,6 +807,7 @@ function pushTranscript(role, text) {
             itemRoles.set(response.item.id, response.item.role);
             if (response.item.role === 'user') {
               lastUserItemId = response.item.id;
+              noteClientActivity();
               logOpenAI(`User voice command detected for ${channelId}, stopping current playback`);
               logger.debug(`VAD triggered - Full message for user voice command: ${JSON.stringify(response, null, 2)}`);
               if (streamHandler) {
@@ -741,69 +875,50 @@ function pushTranscript(role, text) {
             }
 
             if (name === 'validate_phone') {
-              const ch = sipMap.get(channelId);
-              ch.retryCounters = ch.retryCounters || { phone: 0, address: 0 }
-              ch.retryCounters.phone = (ch.retryCounters.phone || 0) + 1;
-              sipMap.set(channelId, ch);
+              let ch = sipMap.get(channelId) || {};
+              const callerRaw = ch.callerNumber || '';
+              const callerNorm = callerRaw ? (validateRussianPhone(callerRaw) || callerRaw) : '';
 
-              logger.info(`[PHONE] function_call attempt ${ch.retryCounters.phone}: ${args}`);
+              logger.info(`[PHONE] validate_phone for ${channelId}: ${typeof args === 'string' ? args : JSON.stringify(args)}`);
 
-              if (ch.retryCounters.phone >= config.MAX_VALIDATION_RETRIES) {
-                logger.warn(`[PHONE] Max retries reached for ${channelId}, skipping validation`);
-                ch.retryCounters.phone = 0;
+              toolResult = await runValidatePhone(args);
+              let parsed;
+              try { parsed = JSON.parse(toolResult); } catch {}
 
-                let phoneForSave = '';
-                try {
-                  const pa = (typeof args === 'string') ? JSON.parse(args) : (args || {});
-                  const rawPhone = String(pa?.phone ?? '');
-                  let digits = rawPhone.replace(/\D/g, '');
-                  if (digits.length === 11 && digits.startsWith('8')) digits = '7' + digits.slice(1);
-                  phoneForSave = (digits.length === 11 && digits.startsWith('7')) ? `+${digits}` : rawPhone;
-                } catch {}
+              if (ch.slots) {
+                ch.slots.phone.validated = true;
+                ch.slots.phone.pendingTool = null;
+              }
 
-                ch.lastPhoneRaw = phoneForSave;
+              if (parsed?.ok && parsed?.normalized) {
+                ch.lastValidatedPhone = parsed.normalized;
+                sipMap.set(channelId, ch);
+                logger.info(`[PHONE] valid -> основной=${parsed.normalized} for ${channelId}`);
+                sendFunctionResult(
+                  ws,
+                  call_id,
+                  JSON.stringify({
+                    ok: true,
+                    normalized: parsed.normalized,
+                    message: 'Номер принят как контактный. Не проговаривай его сейчас — сразу переходи к следующему пункту оформления.',
+                  }),
+                  enqueueResponseCreate
+                );
+              } else {
                 ch.lastValidatedPhone = null;
                 sipMap.set(channelId, ch);
-
-                const phoneToSay = formatRuPhoneMasked(phoneForSave) || phoneForSave;
-                logger.info(`[PHONE] skip: saved lastPhoneRaw="${phoneForSave}" (say="${phoneToSay}") for ${channelId}`);
-
-                toolResult = JSON.stringify({ ok: true, skipped: true, message: "Превышен лимит переспросов. Не проверяй номер снова. Скажи клиенту: Хорошо, я записал номер, как вы продиктовали, проверим в конце. Если что-то неверно — оператор уточнит при звонке" });
-                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
-
-                enqueueResponseCreate({
-                  output_modalities: ['audio'],
-                  instructions: 'Скажи ровно: "Хорошо, я записал номер, как вы продиктовали, проверим в конце. Если что-то неверно — оператор уточнит при звонке."'
-                });
-              } else {
-                toolResult = await runValidatePhone(args);
-
-                // не даём модели "самой" строить подтверждение без жёсткого текста
-                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
-
-                let parsed;
-                try { parsed = JSON.parse(toolResult); } catch {}
-
-                if (parsed?.ok && parsed?.normalized) {
-                  const masked = formatRuPhoneMasked(parsed.normalized);
-
-                  ch.lastValidatedPhone = parsed.normalized;
-                  ch.lastPhoneRaw = null;
-                  sipMap.set(channelId, ch);
-
-                  // fallback если вдруг не смогли замаскировать
-                  const phoneToSay = masked || String(parsed.normalized);
-
-                  enqueueResponseCreate({
-                    output_modalities: ['audio'],
-                    instructions: `Произнеси строго без изменений, проговаривая точно по одной цифре (например +7 9 0 9 5 6 2 8 4 2 0): Я записал номер телефона ${phoneToSay}. Всё верно?`
-                  });
-                } else {
-                  enqueueResponseCreate({
-                    output_modalities: ['audio'],
-                    instructions: `Скажи ровно: "Похоже, номер некорректен. Продиктуйте, пожалуйста, номер полностью, сейчас именно по одной цифре, начиная с +7."`
-                  });
-                }
+                logger.info(`[PHONE] invalid -> откат на номер АТС ${callerNorm || callerRaw || '(нет)'} for ${channelId}`);
+                sendFunctionResult(
+                  ws,
+                  call_id,
+                  JSON.stringify({
+                    ok: false,
+                    fallback_to_caller: true,
+                    caller_phone: callerNorm || callerRaw || '',
+                    message: 'Номер не распознан. НЕ переспрашивай номер у клиента. Используй как контактный номер тот, с которого звонит клиент (caller_phone). Сразу переходи к следующему пункту оформления.',
+                  }),
+                  enqueueResponseCreate
+                );
               }
             }
             else if (name === 'validate_address') {
@@ -912,6 +1027,29 @@ function pushTranscript(role, text) {
                       `[ADDRESS] saved spoken_city="${ch.lastValidatedAddress.spoken_city}" ` +
                       `(system_city="${ch.lastValidatedAddress.system_city}") for ${channelId}`
                     );
+
+                    const li = clientLocalDateInfo(ch.lastValidatedAddress?.timezone);
+                    logger.info(`[ADDRESS] client local time for ${channelId}: ${li.todayISO} ${li.nowTime} (${li.zone}), withinWorkingHours=${li.withinWorkingHours}`);
+                    const dateNote =
+                      `[СИСТЕМНО] Местное время клиента: ${li.todayISO} ${li.nowTime} (${li.zone}). ` +
+                      `Дату визита определяй ИМЕННО по этому местному времени клиента. ` +
+                      `По умолчанию оформляй на сегодня (${li.todayISO}). ` +
+                      (li.withinWorkingHours
+                        ? ''
+                        : `Сейчас у клиента вне 8:00–19:00, поэтому оформляй на завтра (${li.tomorrowISO}) и скажи клиенту, что мастер увидит заявку завтра утром. `) +
+                      `Дату у клиента не спрашивай; используй названную им дату, только если он сам её назвал.`;
+                    try {
+                      ws.send(JSON.stringify({
+                        type: 'conversation.item.create',
+                        item: {
+                          type: 'message',
+                          role: 'user',
+                          content: [{ type: 'input_text', text: dateNote }],
+                        },
+                      }));
+                    } catch (e) {
+                      logger.error(`[ADDRESS] failed to send local-time note for ${channelId}: ${e.message}`);
+                    }
                   }
                   sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
                 }
@@ -999,13 +1137,25 @@ function pushTranscript(role, text) {
               const callerNumber = channelEntry ? channelEntry[1].callerNumber : null;
               const chSave = sipMap.get(channelId);
               const validatedAddr = chSave?.lastValidatedAddress;
+              const callerNorm = callerNumber ? (validateRussianPhone(callerNumber) || callerNumber) : '';
+              const hasOwnMain = !!chSave?.lastValidatedPhone;
+              const mainPhone = String(chSave?.lastValidatedPhone || callerNorm || a.phone || '');
+              const additionalPhone = hasOwnMain ? (callerNumber || '') : '';
+
+              let visitDate = String(a.date || '').trim();
+              if (!visitDate) {
+                const li = clientLocalDateInfo(validatedAddr?.timezone);
+                visitDate = li.withinWorkingHours ? li.todayISO : li.tomorrowISO;
+                logger.info(`[SAVE] date not provided -> default by client tz ${li.zone}: ${visitDate} (withinWorkingHours=${li.withinWorkingHours})`);
+              }
+
               const clientData = {
                 name: a.name,
                 direction: a.direction,
                 circumstances: a.circumstances || '',
                 brand: a.brand || '',
-                phone: String(chSave?.lastValidatedPhone || chSave?.lastPhoneRaw || a.phone),
-                phone2: callerNumber || '',
+                phone: mainPhone,
+                phone2: additionalPhone,
                 address: {
                   // city — город филиала для 1С (name_components, маршрутизация)
                   city: a.address?.city,
@@ -1022,7 +1172,7 @@ function pushTranscript(role, text) {
                   latitude: a.address?.latitude,
                   longitude: a.address?.longitude
                 },
-                date: a.date || '',
+                date: visitDate,
                 comment: a.comment || '',
                 multipleRequest: !!(a.multiple_request ?? a.multipleRequest ?? false)
               };
@@ -1044,8 +1194,7 @@ function pushTranscript(role, text) {
                 sendFunctionResult(ws, call_id, JSON.stringify({ ok: false, error: 'save_failed' }), enqueueResponseCreate);
               }
             }
-                        // === ЕДИНЫЙ ПОСТ-ОБРАБОТЧИК ДЛЯ phone И address ===
-            if (name === 'validate_phone' || name === 'validate_address') {
+            if (name === 'validate_address') {
               if (!toolResult) { 
                   logger.warn(`[POST-RESULT] ${name}: empty toolResult`);
                   continue;
@@ -1053,7 +1202,7 @@ function pushTranscript(role, text) {
               try {
                 const parsed = JSON.parse(toolResult);
                 let ch = sipMap.get(channelId);
-                const slot = name === 'validate_phone' ? 'phone' : 'address';
+                const slot = 'address';
 
                 // 1) Обновляем слоты
                 if (ch?.slots) {
@@ -1237,32 +1386,30 @@ function pushTranscript(role, text) {
             if (ch.transcriptWindow.length > 10) ch.transcriptWindow.shift();
             sipMap.set(channelId, ch);
 
-            // --- мягкий сторож коррекций ---
             ch = sipMap.get(channelId);
-            if (ch?.slots && hasCorrectionIntent(text)) {
-              // если недавно валидировали телефон/адрес — считаем, что правят текущий незакрытый слот
-              // приоритет: address, затем phone (чаще правят адрес позднее)
-              const target = (!ch.slots.address.validated ? 'address'
-                              : !ch.slots.phone.validated ? 'phone'
-                              : 'address'); // fallback — вероятнее поправляют адрес
+            if (ch?.slots && ch.slots.address.validated && hasCorrectionIntent(text)) {
+              const mentionsPhone = /телефон|номер/i.test(text);
+              const mentionsAddr = /адрес|город|улиц|дом|кварт|подъезд|этаж|домофон/i.test(text);
+              const target = (mentionsPhone && !mentionsAddr) ? 'phone'
+                           : (mentionsAddr && !mentionsPhone) ? 'address'
+                           : null;
 
-              // Сбрасываем валидацию и pendingTool по выбранному слоту
-              ch.slots[target].validated = false;
-              ch.slots[target].pendingTool = null;
-              sipMap.set(channelId, ch);
-
-              // Вежливо просим продиктовать заново и обещаем проверить
-              const ask =
-                target === 'phone'
-                  ? 'Давайте ещё раз продиктуете номер полностью, сейчас именно по одной цифре, начиная с +7. Я проверю и сразу повторю вам то, что записал.'
-                  : 'Давайте ещё раз: город, улица, дом — продиктуйте, пожалуйста, полностью. Я проверю адрес и повторю вам итог.';
-
-              // Прерываем текущий ответ ассистента (если говорил) и задаём уточнение
-              try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
-              enqueueResponseCreate({
-                output_modalities: ['audio'],
-                instructions: ask
-              });
+              if (target === 'address') {
+                ch.slots.address.validated = false;
+                ch.slots.address.pendingTool = null;
+                sipMap.set(channelId, ch);
+                try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+                enqueueResponseCreate({
+                  output_modalities: ['audio'],
+                  instructions: 'Давайте ещё раз: город, улица, дом — продиктуйте, пожалуйста, полностью. Я проверю адрес и повторю вам итог.'
+                });
+              } else if (target === 'phone') {
+                try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+                enqueueResponseCreate({
+                  output_modalities: ['audio'],
+                  instructions: 'Хорошо, продиктуйте, пожалуйста, контактный номер полностью, сейчас именно по одной цифре, начиная с +7 — я проверю и сразу повторю вам то, что записал.'
+                });
+              }
             }
           }
           break;
@@ -1287,6 +1434,7 @@ function pushTranscript(role, text) {
             lastUserItemId = null;
             responseBuffer = Buffer.alloc(0);
             flushResponseQueue();
+            scheduleInactivityAfterSpeech();
             break;
           }
         case 'error': {
@@ -1344,7 +1492,8 @@ const tools = [
       required: ['name', 'direction', 'phone', 'address'],
       properties: {
         name:        { type: 'string',  description: 'Имя клиента' },
-        direction:   { type: 'string',  description: 'цель / причина обращения',
+        direction: {
+          type: 'string', description: 'цель / причина обращения',
           enum: [
             'Холодильники',
             'Кондиционеры',
@@ -1361,16 +1510,16 @@ const tools = [
             'Промышленный холод',
             'Газовые колонки',
             'Установка',
-            'Пылесосы',
             'Клининг',
             'Дезинсекция',
             'Натяжные потолки',
             'Мелкобытовой сервис',
             'Ремонт квартир',
             'Сантехника',
-            'Вывоз мусора',
+            'Вывоз мусора партнеры',
             'Уборка',
             'Электрика',
+            'Вскрытие замков',
             'Окна'
           ]
         },
@@ -1465,11 +1614,20 @@ const tools = [
       ws.on('open', async () => {
         logClient(`OpenAI WebSocket connected for ${channelId}`);
         const systemPromptFinal = buildSystemPromptFinal();
+
+        const callerRaw = channelData.callerNumber || '';
+        const callerNorm = callerRaw ? (validateRussianPhone(callerRaw) || callerRaw) : '';
+        const phoneStepNote = callerNorm
+          ? `\n\n[ТЕЛЕФОН] Номер, с которого звонит клиент (АТС): ${callerNorm}. Это контактный номер по умолчанию. На этапе телефона (пункт 5) НЕ проси клиента именно диктовать номер — спроси своими словами, можно ли использовать для связи с мастером именно тот номер, с которого он звонит. Если согласен — используй ${callerNorm} как контактный и НЕ вызывай validate_phone. Если хочет другой номер — попроси продиктовать и вызови validate_phone один раз.`
+          : `\n\n[ТЕЛЕФОН] Номер АТС неизвестен. На этапе телефона (пункт 5) попроси клиента продиктовать контактный номер полностью, начиная с +7, и вызови validate_phone.`;
+        const sessionInstructions = systemPromptFinal + phoneStepNote;
+        logClient(`Caller number for ${channelId}: raw="${callerRaw}" norm="${callerNorm}"`);
+
         ws.send(JSON.stringify({
           type: 'session.update',
           session: {
             type: 'realtime',
-            instructions: systemPromptFinal,
+            instructions: sessionInstructions,
             output_modalities: ['audio'],
             audio: {
               input: {
@@ -1506,25 +1664,25 @@ const tools = [
           channelData.totalDeltaBytes = 0; // Initialize totalDeltaBytes
           channelData.retryCounters = { phone: 0, address: 0 };
           channelData.slots = {
-          phone:   { required: true, validated: false, pendingTool: null },
+          phone:   { required: true, validated: !!callerNorm, pendingTool: null },
           address: { required: true, validated: false, pendingTool: null },
           };
           sipMap.set(channelId, channelData);
 
           const itemId = uuid().replace(/-/g, '').substring(0, 32);
-          logClient(`Sending initial message for ${channelId}: ${config.INITIAL_MESSAGE || 'Здравствуйте! Я голосовой ассистент по заявкам на ремонт и бытовые услуги, помогаю оформить заявку на выезд мастера'}`);
+          logClient(`Sending initial message for ${channelId}: ${config.INITIAL_MESSAGE || 'Здравствуйте! Я голосовой помощник сервисного центра. Оформляю заявку на выезд мастера'}`);
           ws.send(JSON.stringify({
             type: 'conversation.item.create',
             item: {
               id: itemId,
               type: 'message',
               role: 'user',
-              content: [{ type: 'input_text', text: config.INITIAL_MESSAGE || 'Здравствуйте! Я голосовой ассистент по заявкам на ремонт и бытовые услуги, помогаю оформить заявку на выезд мастера' }]
+              content: [{ type: 'input_text', text: config.INITIAL_MESSAGE || 'Здравствуйте! Я голосовой помощник сервисного центра. Оформляю заявку на выезд мастера' }]
             }
           }));
             enqueueResponseCreate({
                 output_modalities: ['audio'],
-                instructions: systemPromptFinal
+                instructions: sessionInstructions
               });
           logClient(`Requested response for ${channelId}`);
           isResponseActive = true;
@@ -1557,6 +1715,9 @@ const tools = [
 
       const handleClose = () => {
         logger.info(`WebSocket closed for ${channelId}`);
+        clearInactivityTimer();
+        clearPlaybackFallback();
+        rtpEvents.off('audioFinished', onAudioFinishedForSilence);
         channelData.wsClosed = true;
         channelData.ws = null;
         sipMap.set(channelId, channelData);

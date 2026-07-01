@@ -120,7 +120,7 @@ def build_order(client: dict) -> dict:
     if visit_raw:
         candidate_dt = f"{visit_raw}T00:00Z"
     else:
-        candidate_dt = template_dt
+        candidate_dt = f"{dt.datetime.now(MSK_TZ).date().isoformat()}T00:00Z"
     # проверка валидности
     iso_midnight = re.compile(r"^\d{4}-\d{2}-\d{2}T00:00Z$")
     if not iso_midnight.match(candidate_dt):
@@ -238,7 +238,8 @@ def send_order(uid: str, order: dict) -> None:
 
     ws_client_path = {cp: ws_path}
 
-    phone_incoming = (order["order"].get("client", {}) or {}).get("phoneIncoming") or ""
+    client_obj = (order["order"].get("client", {}) or {})
+    phone_incoming = client_obj.get("phoneIncoming") or client_obj.get("phone") or ""
     phone_digits = ''.join(filter(str.isdigit, phone_incoming))
     partner_id = phone_digits or "0"
 

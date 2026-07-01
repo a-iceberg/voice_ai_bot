@@ -38,14 +38,16 @@ const config = {
   INITIAL_MESSAGE: process.env.INITIAL_MESSAGE || 'Здравствуйте! Я голосовой ассистент приема заявок компании Айсберг',
   SILENCE_PADDING_MS: parseInt(process.env.SILENCE_PADDING_MS) || 100,
   CALL_DURATION_LIMIT_SECONDS: parseInt(process.env.CALL_DURATION_LIMIT_SECONDS) || 0, // 0 means no limit
-  MAX_VALIDATION_RETRIES: parseInt(process.env.MAX_VALIDATION_RETRIES) || 2
+  MAX_VALIDATION_RETRIES: parseInt(process.env.MAX_VALIDATION_RETRIES) || 2,
+  SILENCE_GREETING_TIMEOUT_SEC: parseInt(process.env.SILENCE_GREETING_TIMEOUT_SEC) || 30,
+  SILENCE_CONVO_TIMEOUT_SEC: parseInt(process.env.SILENCE_CONVO_TIMEOUT_SEC) || 30,
+  SILENCE_CONTINUE_WAIT_SEC: parseInt(process.env.SILENCE_CONTINUE_WAIT_SEC) || 120,
+  SILENCE_INAUDIBLE_HANGUP_SEC: parseInt(process.env.SILENCE_INAUDIBLE_HANGUP_SEC) || 5
 };
 
 let sentEventCounter = 0;
 let receivedEventCounter = -1;
 
-// единый препроцессор: считает счётчики и красит сообщение (для консоли),
-// а для файла оставляем «чистый» текст без ANSI
 const withCounters = winston.format((info) => {
   const msg = String(info.message);
   const origin = msg.split(' ', 1)[0];
@@ -64,11 +66,10 @@ const withCounters = winston.format((info) => {
     info.messageColored = chalk.gray(msg);
   }
   info.counter = counter;
-  info.messagePlain = msg; // для файлового вывода
+  info.messagePlain = msg;
   return info;
 });
 
-// формат для консоли
 const consoleFormat = winston.format.combine(
   winston.format.timestamp(),
   withCounters(),
@@ -77,7 +78,6 @@ const consoleFormat = winston.format.combine(
   )
 );
 
-// формат для файла (без цветов)
 const fileFormat = winston.format.combine(
   winston.format.timestamp(),
   withCounters(),
@@ -89,10 +89,8 @@ const fileFormat = winston.format.combine(
 const logger = winston.createLogger({
   level: config.LOG_LEVEL,
   transports: [
-    // консоль, как и раньше — с цветами
     new winston.transports.Console({ format: consoleFormat }),
 
-    // файл с дневной ротацией
     new DailyRotateFile({
       dirname: 'logs',
       filename: 'app-%DATE%.log',
@@ -103,7 +101,6 @@ const logger = winston.createLogger({
       format: fileFormat
     })
   ],
-  // отдельные файлы для неотловленных исключений/промисов
   exceptionHandlers: [
     new DailyRotateFile({
       dirname: 'logs',
