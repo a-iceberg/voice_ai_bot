@@ -52,6 +52,14 @@ with open(BASE_DIR / "data/order_template.json", encoding="utf-8") as f:
     ORDER_TEMPLATE = json.load(f)       # шаблон заказа (dict)
 
 MSK_TZ = dt.timezone(dt.timedelta(hours=3))
+DIRECTION_ALIASES = {
+    "Вывоз мусора": "Вывоз мусора партнеры",
+    "Вскрытие и установка замков": "Вскрытие замков",
+}
+
+def normalize_direction(value: str) -> str:
+    v = (value or "").strip()
+    return DIRECTION_ALIASES.get(v, v)
 
 # ────────────────────────────────────────────────────────────────
 def russian_address(addr: dict) -> str:
@@ -68,11 +76,12 @@ def save_to_txt(client: dict) -> None:
         a["city"] = a["spoken_city"]
     with open(BASE_DIR / "clients_info.txt", "a", encoding="utf-8") as file:
         file.write(f"Имя: {client.get('name','')}\n")
-        file.write(f"Цель обращения: {client.get('direction','')}\n")
+        file.write(f"Цель обращения: {normalize_direction(client.get('direction',''))}\n")
         file.write(f"Подробности неисправности: {client.get('circumstances','')}\n")
         file.write(f"Бренд и модель техники: {client.get('brand','')}\n")
         file.write(f"Телефон: {client.get('phone','')}\n")
         file.write(f"Второй телефон (callerID): {client.get('phone2','')}\n")
+        file.write(f"Набранный номер (DID): {client.get('phoneBot','')}\n")
         file.write(f"Адрес: {russian_address(a)}\n")
         file.write(f"Квартира: {a.get('apartment','')}\n")
         file.write(f"Подъезд: {a.get('entrance','')}\n")
@@ -106,7 +115,7 @@ def build_order(client: dict) -> dict:
     phone_digits = ''.join(filter(str.isdigit, phone_incoming))
     uid = now.strftime("%Y%m%d%H%M%S") + phone_digits
     order["order"]["uslugi_id"] = uid
-    order["order"]["services"][0]["service_id"] = client.get("direction", "")
+    order["order"]["services"][0]["service_id"] = normalize_direction(client.get("direction", ""))
     # дата приходит как "2025-06-18" => делаем ISO-8601 с Z
     visit_raw  = client.get("date", now.date().isoformat())
 
@@ -151,6 +160,9 @@ def build_order(client: dict) -> dict:
 
     order["order"]["multipleRequest"] = bool(client.get("multipleRequest", order["order"].get("multipleRequest", False)))
 
+    # номер, НА который позвонил клиент (DID / набранная линия)
+    order["order"]["phoneBot"] = client.get("phoneBot", "")
+
     # name_components.locality — только город филиала (для маршрутизации в 1С)
     city = filial_city
     if city:
@@ -194,7 +206,7 @@ def send_order(uid: str, order: dict) -> None:
 
     # POST в 1С
     try:
-        resp = requests.post(order_url, json=payload, timeout=60)
+        resp = requests.post(order_url, json=payload, timeout=90)
 
         if resp.status_code >= 400:
             try:

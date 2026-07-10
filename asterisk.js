@@ -196,6 +196,21 @@ async function initializeAriClient() {
         await channel.answer();
         logger.info(`Channel ${channel.id} answered, bridge ${bridgeId} created for SIP audio`);
 
+        let phoneBot = null;
+        try {
+          const botDidVar = await channel.getChannelVar({ variable: 'BOT_DID' });
+          const botDidValue = botDidVar ? /** @type {any} */ (botDidVar).value : null;
+          if (botDidValue) phoneBot = String(botDidValue).trim();
+        } catch (e) {
+          logger.warn(`Could not read BOT_DID for ${channel.id}: ${e.message}`);
+        }
+        if (!phoneBot) {
+          phoneBot = (channel.dialplan && channel.dialplan.exten)
+            ? String(channel.dialplan.exten).trim()
+            : null;
+        }
+        logger.info(`Dialed number (DID) for ${channel.id}: ${phoneBot || 'unknown'} (exten=${channel.dialplan?.exten || 'n/a'})`);
+
         let port = null;
         const maxBindAttempts = 3;
         let lastBindError = null;
@@ -234,7 +249,8 @@ async function initializeAriClient() {
         channel,
         rtpPort: port,
         wsClosed: false,
-        callerNumber: (channel?.caller && channel.caller.number) ? String(channel.caller.number) : null
+        callerNumber: (channel?.caller && channel.caller.number) ? String(channel.caller.number) : null,
+        phoneBot: phoneBot || null
       });
         const extChannel = await ariClient.channels.externalMedia(extParams);
         logger.info(`ExternalMedia channel ${extChannel.id} created with codec ulaw, RTP to 127.0.0.1:${port}`);

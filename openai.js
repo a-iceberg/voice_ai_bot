@@ -23,6 +23,27 @@ if (DD_PROXY_DISPATCHER) {
 const { DateTime } = require("luxon");
 const TZ = "Europe/Moscow";
 
+let DID_CITY = { default: 'msk', map: {} };
+try {
+  DID_CITY = require('./data/did_city.json');
+  if (!DID_CITY.map) DID_CITY.map = {};
+  if (!DID_CITY.default) DID_CITY.default = 'msk';
+  logger.info(`[DID_CITY] loaded ${Object.keys(DID_CITY.map).length} DID mappings, default="${DID_CITY.default}"`);
+} catch (e) {
+  logger.warn(`[DID_CITY] не удалось загрузить did_city: ${e.message} — используется дефолт "msk"`);
+}
+
+function normalizeDid(raw) {
+  const digits = String(raw || '').replace(/\D/g, '');
+  if (digits.length === 11 && (digits[0] === '7' || digits[0] === '8')) return digits.slice(1);
+  return digits;
+}
+
+function cityByDid(raw) {
+  const key = normalizeDid(raw);
+  return (key && DID_CITY.map[key]) || DID_CITY.default || 'msk';
+}
+
 // ----------------------------
 // µ-law decode table + silence detector
 const MULAW_DECODE_TABLE = (() => {
@@ -100,7 +121,7 @@ function clientLocalDateInfo(tzStr) {
     nowTime: now.toFormat('HH:mm'),
     todayISO: now.toISODate() || '',
     tomorrowISO: now.plus({ days: 1 }).toISODate() || '',
-    withinWorkingHours: now.hour >= 8 && now.hour < 19,
+    withinWorkingHours: now.hour >= 0 && now.hour < 19,
   };
 }
 //-----------------------------
@@ -121,6 +142,43 @@ const CORRECTION_PATTERNS = [
 function hasCorrectionIntent(text) {
   const t = (text || '').toLowerCase();
   return CORRECTION_PATTERNS.some(rx => rx.test(t));
+}
+
+const DIRECTION_KEYWORDS = [
+  [/посудомо|посудомойк/i, 'Посудомоечные машины'],
+  [/стиральн|стиралк/i, 'Стиральные машины'],
+  [/швейн/i, 'Швейные машины'],
+  [/кофемашин|кофеварк|кофе[-\s]?машин/i, 'Кофемашины'],
+  [/микроволнов|\bсвч\b|микроволновк/i, 'Микроволновки'],
+  [/холодильник|морозильник|холодос/i, 'Холодильники'],
+  [/промышленн\w*\s+холод|промхолод/i, 'Промышленный холод'],
+  [/кондиционер|сплит[-\s]?систем|кондей/i, 'Кондиционеры'],
+  [/телевизор|телек|\bтв\b/i, 'Телевизоры'],
+  [/вытяжк/i, 'Вытяжки'],
+  [/газов\w*\s+колонк|\bколонк/i, 'Газовые колонки'],
+  [/плит[аоуы]|варочн|духовк|духов\b/i, 'Плиты'],
+  [/компьютер|ноутбук|\bпк\b|\bкомп\b/i, 'Компьютеры'],
+  [/смартфон|планшет|гаджет/i, 'Гаджеты'],
+  [/натяжн\w*\s+потол|потолок|потолк/i, 'Натяжные потолки'],
+  [/дезинсекц|таракан|\bклоп|насеком/i, 'Дезинсекция'],
+  [/клининг/i, 'Клининг'],
+  [/сантехник|смеситель|\bкран\b|унитаз|засор|\bтруб/i, 'Сантехника'],
+  [/электрик|проводк|розетк|электричеств/i, 'Электрика'],
+  [/вскрыт\w*\s+замк|\bзамок\b|\bзамк[аи]/i, 'Вскрытие замков'],
+  [/\bокно\b|\bокн[аоуе]\b|стеклопакет/i, 'Окна'],
+  [/вывоз\w*\s+мусор|\bмусор/i, 'Вывоз мусора партнеры'],
+  [/уборк/i, 'Уборка'],
+  [/ремонт\w*\s+квартир|квартир/i, 'Ремонт квартир'],
+  [/установк/i, 'Установка'],
+  [/мелкобытов|утюг|блендер|миксер|\bфен\b|чайник|мультиварк/i, 'Мелкобытовой сервис'],
+];
+
+function detectDirection(text) {
+  const t = String(text || '');
+  for (const [rx, name] of DIRECTION_KEYWORDS) {
+    if (rx.test(t)) return name;
+  }
+  return '';
 }
 
 function normalizePhoneToE164Like(input) {
@@ -324,8 +382,48 @@ function applyLastValidatedAddress(ch, normalized) {
     house_number: normalized.house_number || '',
     display_name: normalized.display_name || '',
     timezone: normalized.timezone || '',
+    affilate: normalized.affilate || '',
   };
   return ch;
+}
+
+/**
+ * @param {string} query Адрес для стандартизации
+ * @returns {Promise<string>}
+ */
+async function fetchDaDataTimezone(query) {
+  const q = String(query || '').trim();
+  if (!q) return '';
+  if (!config.DD_API_KEY || !config.DD_SECRET_KEY) {
+    logger.warn('[ADDRESS] Нет DD_API_KEY/DD_SECRET_KEY — таймзона через clean-API недоступна');
+    return '';
+  }
+  try {
+    const resp = await undiciFetch(
+      'https://cleaner.dadata.ru/api/v1/clean/address',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Authorization': `Token ${config.DD_API_KEY}`,
+          'X-Secret': config.DD_SECRET_KEY,
+        },
+        body: JSON.stringify([q]),
+        dispatcher: DD_PROXY_DISPATCHER,
+      }
+    );
+    if (!resp.ok) {
+      logger.warn(`[ADDRESS] DaData clean HTTP ${resp.status} — таймзона не получена`);
+      return '';
+    }
+    const json = /** @type {any} */ (await resp.json());
+    const row = Array.isArray(json) ? json[0] : null;
+    return String(row?.timezone || '').trim();
+  } catch (e) {
+    logger.warn(`[ADDRESS] DaData clean exception: ${e.message} — таймзона не получена`);
+    return '';
+  }
 }
 
 async function runValidateAddress(args) {
@@ -412,8 +510,7 @@ async function runValidateAddress(args) {
   const spokenCity = String(
     dd.city || dd.settlement || dd.area || dd.region || city || ''
   ).trim();
-  // Часовой пояс клиента из DaData (формат вида "UTC+5"); нужен для даты визита по местному времени.
-  const ddTimezone = String(dd.timezone || '').trim();
+  const ddTimezone = await fetchDaDataTimezone(display_name);
 
   logger.info(
     `[ADDRESS] DaData OK: "${display_name}" (${latitude},${longitude}) | nearest=${affilate || 'none'} | dist=${Number.isFinite(distance) ? distance.toFixed(2) : 'inf'}km | direction="${direction}" | zone=${zone} | spoken_city="${spokenCity}"`
@@ -430,14 +527,15 @@ async function runValidateAddress(args) {
   }
 
   const normalized = {
-    city: localityCity,        // системный/филиальный город (идёт в save_client_info → 1С)
-    spoken_city: spokenCity,   // реальный город из DaData (только для озвучки клиенту)
+    city: localityCity,
+    spoken_city: spokenCity,
     street,
     house_number: house,
     latitude,
     longitude,
     display_name,
-    timezone: ddTimezone,      // часовой пояс клиента ("UTC+5") для определения даты визита
+    timezone: ddTimezone,
+    affilate,
   };
 
   if (zone === 'paid') {
@@ -595,6 +693,7 @@ async function startOpenAIWebSocket(channelId) {
   let messageQueue = [];
   let itemRoles = new Map();
   let lastUserItemId = null;
+  let initialGreetingItemId = null;
   let transcriptWindow = [];
 function pushTranscript(role, text) {
   transcriptWindow.push({ role, text, t: Date.now() });
@@ -611,6 +710,7 @@ function pushTranscript(role, text) {
   let inactivityTimer = null;
   let hasClientSpoken = false;
   let pendingAfterPrompt = null;
+  let conversationSilenceDrop = false;
 
   function clearInactivityTimer() {
     if (inactivityTimer) {
@@ -634,20 +734,103 @@ function pushTranscript(role, text) {
     pendingAfterPrompt = null;
     awaitingPlaybackEnd = false;
     scheduledSilenceAction = null;
+    conversationSilenceDrop = false;
     clearPlaybackFallback();
     clearInactivityTimer();
   }
 
   function speakInactivityPhrase(text) {
+    try {
+      if (ws && ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'conversation.item.create',
+          item: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: `Произнеси клиенту дословно, не повторяя предыдущие фразы: "${text}"` }],
+          },
+        }));
+      }
+    } catch (e) {
+      logger.error(`[SILENCE] failed to add inactivity item for ${channelId}: ${e.message}`);
+    }
     enqueueResponseCreate({
       output_modalities: ['audio'],
-      instructions: `Скажи ровно: "${text}"`,
+      instructions: `Произнеси дословно: "${text}"`,
     });
+  }
+
+  function requestCallbackTask() {
+    try {
+      const ch = sipMap.get(channelId) || {};
+      const callerNumber = ch.callerNumber || '';
+      const callerNorm = callerNumber ? (validateRussianPhone(callerNumber) || callerNumber) : '';
+      const mainPhone = String(ch.lastValidatedPhone || callerNorm || '');
+      const addr = ch.lastValidatedAddress || {};
+      const addrCity = addr.affilate ? (String(addr.affilate).split('_')[1] || '') : '';
+      const cityCode = addrCity || cityByDid(ch.phoneBot);
+
+      const clientMessage = (ch.transcriptWindow || [])
+        .filter(x => x && x.role === 'user' && x.text)
+        .map(x => String(x.text).trim())
+        .filter(Boolean)
+        .join('; ');
+
+      const payload = {
+        name: ch.lastName || '',
+        phone: mainPhone,
+        direction: ch.lastDirection || '',
+        brand: ch.lastBrand || '',
+        circumstances: ch.lastCircumstances || '',
+        comment: ch.lastComment || '',
+        message: clientMessage,
+        city: cityCode,
+        did: ch.phoneBot || '',
+      };
+
+      logger.info(`[SILENCE] Создаю заявку на обратный звонок для ${channelId}: phone=${payload.phone}, direction=${payload.direction}, city=${payload.city}, did=${payload.did}`);
+
+      const proc = spawn('python3', ['-u', 'request_call.py'], { stdio: ['pipe', 'pipe', 'pipe'] });
+      proc.stdout.on('data', d => String(d).split('\n').filter(Boolean).forEach(line => logger.info(`[request_call] ${line}`)));
+      proc.stderr.on('data', d => String(d).split('\n').filter(Boolean).forEach(line => logger.error(`[request_call:stderr] ${line}`)));
+      proc.on('error', e => logger.error(`[request_call] spawn error для ${channelId}: ${e.message}`));
+      proc.stdin.write(JSON.stringify(payload));
+      proc.stdin.end();
+    } catch (e) {
+      logger.error(`[SILENCE] Не удалось создать заявку на обратный звонок для ${channelId}: ${e.message}`);
+    }
+  }
+
+  function endCallAfterPhrase(tag = 'END') {
+    clearInactivityTimer();
+    clearPlaybackFallback();
+    let done = false;
+    let fallback = null;
+    const finish = async (id) => {
+      if (done || id !== channelId) return;
+      done = true;
+      rtpEvents.off('audioFinished', finish);
+      if (fallback) clearTimeout(fallback);
+      logger.info(`[${tag}] Прощальная фраза проиграна — завершаю звонок ${channelId}`);
+      try { if (ws && ws.readyState === ws.OPEN) ws.close(); } catch {}
+      try {
+        const { cleanupChannel } = require('./asterisk');
+        await cleanupChannel(channelId);
+      } catch (e) {
+        logger.error(`[${tag}] cleanupChannel не удался для ${channelId}: ${e.message}`);
+      }
+    };
+    fallback = setTimeout(() => finish(channelId), 20000);
+    rtpEvents.on('audioFinished', finish);
   }
 
   async function dropCallForSilence() {
     logger.info(`[SILENCE] Клиент молчит — сбрасываю звонок ${channelId}`);
     clearInactivityTimer();
+    if (conversationSilenceDrop) {
+      conversationSilenceDrop = false;
+      requestCallbackTask();
+    }
     try { if (ws && ws.readyState === ws.OPEN) ws.close(); } catch {}
     try {
       const { cleanupChannel } = require('./asterisk');
@@ -671,6 +854,7 @@ function pushTranscript(role, text) {
 
   function onContinueTimeout() {
     logger.info(`[SILENCE] Нет ответа после "Готовы продолжить?" для ${channelId} -> "Вас не слышно"`);
+    conversationSilenceDrop = true;
     pendingAfterPrompt = 'arm_hangup';
     speakInactivityPhrase(PHRASE_INAUDIBLE);
   }
@@ -799,6 +983,9 @@ function pushTranscript(role, text) {
         case 'input_audio_buffer.speech_started':
           logOpenAI(`Client speech started for ${channelId}`);
           noteClientActivity();
+          if (streamHandler) {
+            try { streamHandler.stopPlayback(); } catch {}
+          }
           break;
         case 'conversation.item.added':
           logOpenAI(`Conversation item added for ${channelId}`);
@@ -806,12 +993,16 @@ function pushTranscript(role, text) {
             logger.debug(`Item created: id=${response.item.id}, role=${response.item.role} for ${channelId}`);
             itemRoles.set(response.item.id, response.item.role);
             if (response.item.role === 'user') {
-              lastUserItemId = response.item.id;
-              noteClientActivity();
-              logOpenAI(`User voice command detected for ${channelId}, stopping current playback`);
-              logger.debug(`VAD triggered - Full message for user voice command: ${JSON.stringify(response, null, 2)}`);
-              if (streamHandler) {
-                streamHandler.stopPlayback();
+              if (response.item.id === initialGreetingItemId) {
+                logOpenAI(`Initial greeting item added for ${channelId}`);
+              } else {
+                lastUserItemId = response.item.id;
+                noteClientActivity();
+                logOpenAI(`User voice command detected for ${channelId}, stopping current playback`);
+                logger.debug(`VAD triggered - Full message for user voice command: ${JSON.stringify(response, null, 2)}`);
+                if (streamHandler) {
+                  streamHandler.stopPlayback();
+                }
               }
             }
           }
@@ -975,49 +1166,17 @@ function pushTranscript(role, text) {
                       'Указанный клиентом адрес находится вне зоны работы нашей компании. Вежливо донесите это до клиента и прекратите далее оформлять заявку.',
                   });
                 } else if (isPaidZone) {
-                  if (isOperatorOffHours()) {
-                    logger.info(`[ADDRESS] zone=paid + off-hours (МСК) — перевод пропущен | channel=${channelId}`);
-                    sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
-                    enqueueResponseCreate({
-                      output_modalities: ['audio'],
-                      instructions:
-                        'Адрес клиента вне зоны бесплатного выезда мастера. ' + OPERATOR_OFFHOURS_INSTRUCTION
-                    });
-                    continue;
-                  }
-
-                  logger.info(`[ADDRESS] zone=paid for ${channelId} — авто-перевод на оператора`);
-
+                  logger.info(`[ADDRESS] zone=paid for ${channelId} — заявка на обратный звонок + завершение звонка`);
                   sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
+                  requestCallbackTask();
+                  const paidPhrase = isOperatorOffHours()
+                    ? ('Адрес клиента вне зоны бесплатного выезда мастера. ' + OPERATOR_OFFHOURS_INSTRUCTION)
+                    : 'Скажи клиенту ровно по смыслу: «К сожалению, ваш адрес находится вне зоны бесплатного выезда мастера. Оператор колл-центра перезвонит вам для уточнения условий. Спасибо за обращение, всего доброго!» и вежливо заверши разговор.';
                   enqueueResponseCreate({
                     output_modalities: ['audio'],
-                    instructions:
-                      parsed.message ||
-                      'Адрес вне зоны бесплатного выезда. Скажите клиенту, что переключаете его на оператора колл-центра для уточнения условий, и сразу прекратите диалог.',
+                    instructions: paidPhrase,
                   });
-
-                  try {
-                    ch = sipMap.get(channelId) || {};
-                    ch.handoffToOperator = true;
-                    sipMap.set(channelId, ch);
-
-                    try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
-                    try { if (ch.streamHandler) ch.streamHandler.stopPlayback(); } catch {}
-
-                    await handoffToOperator(channelId, { context: 'from-TRUNK-MSK-RUS', exten: '1200', priority: 1 });
-                    logger.info(`[HANDOFF/PAID_ZONE] continueInDialplan OK | channel=${channelId} -> from-TRUNK-MSK-RUS,1200,1`);
-                    try { ws.close(); } catch {}
-                  } catch (e) {
-                    logger.error(`[HANDOFF/PAID_ZONE] continueInDialplan FAILED | channel=${channelId} | ${e.message}`);
-                    ch = sipMap.get(channelId) || {};
-                    ch.handoffToOperator = false;
-                    sipMap.set(channelId, ch);
-                    enqueueResponseCreate({
-                      output_modalities: ['audio'],
-                      instructions: 'Не получилось перевести на оператора. Давайте продолжим здесь: что нужно отремонтировать?',
-                    });
-                  }
-
+                  endCallAfterPhrase('PAID_ZONE');
                   continue;
                 } else {
                   if (parsed?.ok === true && parsed?.normalized) {
@@ -1036,7 +1195,7 @@ function pushTranscript(role, text) {
                       `По умолчанию оформляй на сегодня (${li.todayISO}). ` +
                       (li.withinWorkingHours
                         ? ''
-                        : `Сейчас у клиента вне 8:00–19:00, поэтому оформляй на завтра (${li.tomorrowISO}) и скажи клиенту, что мастер увидит заявку завтра утром. `) +
+                        : `Сейчас у клиента наше нерабочее время, поэтому оформляй на завтра (${li.tomorrowISO}) и скажи клиенту, что мастер увидит заявку утром с 8 часов.`) +
                       `Дату у клиента не спрашивай; используй названную им дату, только если он сам её назвал.`;
                     try {
                       ws.send(JSON.stringify({
@@ -1051,7 +1210,9 @@ function pushTranscript(role, text) {
                       logger.error(`[ADDRESS] failed to send local-time note for ${channelId}: ${e.message}`);
                     }
                   }
-                  sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate);
+                  sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, {
+                    createResponse: parsed?.ok === true,
+                  });
                 }
               }
             }
@@ -1062,7 +1223,7 @@ function pushTranscript(role, text) {
               logger.info(`[HANDOFF] tool transfer_to_operator called | channel=${channelId} | reason="${reason}"`);
 
               if (isOperatorOffHours()) {
-                logger.info(`[HANDOFF] off-hours (МСК) — перевод на оператора пропущен | channel=${channelId}`);
+                logger.info(`[HANDOFF] off-hours (МСК) — перевод на оператора пропущен, создаю заявку на обратный звонок | channel=${channelId}`);
                 sendFunctionResult(
                   ws,
                   call_id,
@@ -1070,6 +1231,7 @@ function pushTranscript(role, text) {
                   enqueueResponseCreate,
                   { createResponse: false }
                 );
+                requestCallbackTask();
                 enqueueResponseCreate({
                   output_modalities: ['audio'],
                   instructions: OPERATOR_OFFHOURS_INSTRUCTION
@@ -1174,7 +1336,8 @@ function pushTranscript(role, text) {
                 },
                 date: visitDate,
                 comment: a.comment || '',
-                multipleRequest: !!(a.multiple_request ?? a.multipleRequest ?? false)
+                multipleRequest: !!(a.multiple_request ?? a.multipleRequest ?? false),
+                phoneBot: chSave?.phoneBot || ''
               };
               // Подтверждение делает модель по промпту (одна проверка) — здесь сохраняем напрямую.
               const ch = sipMap.get(channelId) || {};
@@ -1186,12 +1349,54 @@ function pushTranscript(role, text) {
                 `[SAVE] Saving save_client_info for ${channelId}, phone=${clientData.phone}`
               );
 
+              sendFunctionResult(
+                ws,
+                call_id,
+                JSON.stringify({
+                  ok: true,
+                  status: 'processing',
+                  message: 'Оформление начато. Сначала озвучена фраза ожидания, номер заявки будет назван отдельно.'
+                }),
+                enqueueResponseCreate,
+                { createResponse: false }
+              );
+              enqueueResponseCreate({
+                output_modalities: ['audio'],
+                instructions:
+                  'Скажи клиенту дословно, без каких-либо добавлений и изменений: ' +
+                  '«Оставайтесь, пожалуйста, на линии — сейчас я оформлю заявку и назову ее номер».'
+              });
+
               try {
                 const orderNum = await runSaveClientInfo(clientData, logger);
-                // вернём как JSON-строку, чтобы модель могла красиво озвучить
-                sendFunctionResult(ws, call_id, JSON.stringify({ ok: true, order_number: orderNum }), enqueueResponseCreate);
+                ws.send(JSON.stringify({
+                  type: 'conversation.item.create',
+                  item: {
+                    type: 'message',
+                    role: 'system',
+                    content: [{
+                      type: 'input_text',
+                      text: `Заявка успешно принята и сохранена. Номер оформленной заявки: ${orderNum}. Озвучь его клиенту по одной цифре (но только часть с цифрами, без буквенной).`
+                    }]
+                  }
+                }));
+                enqueueResponseCreate({ output_modalities: ['audio'] });
               } catch (e) {
-                sendFunctionResult(ws, call_id, JSON.stringify({ ok: false, error: 'save_failed' }), enqueueResponseCreate);
+                logger.error(`[SAVE] runSaveClientInfo failed for ${channelId}: ${e?.message || e}`);
+                ws.send(JSON.stringify({
+                  type: 'conversation.item.create',
+                  item: {
+                    type: 'message',
+                    role: 'system',
+                    content: [{
+                      type: 'input_text',
+                      text: 'Заявка принята и сохранена. '
+                        + 'Сообщи это клиенту. '
+                        + 'Номер заявки НЕ называй и НЕ придумывай.'
+                    }]
+                  }
+                }));
+                enqueueResponseCreate({ output_modalities: ['audio'] });
               }
             }
             if (name === 'validate_address') {
@@ -1315,11 +1520,13 @@ function pushTranscript(role, text) {
                 if (ch) {
                   const audioBytes  = ch.lastAudioBytes || 0;
                   const audioSec    = audioBytes / 8000;
-                  const expectedSec = (text || '').trim().length / 18; // ~18 симв/сек для русского
-                  const tooShort    = audioSec < 3.0 && expectedSec > 5.0;
+                  const expectedSec = (text || '').trim().length / 18;
+                  const COVERAGE    = 0.8;
+                  const MIN_EXPECTED = 10.0;
+                  const tooShort    = expectedSec >= MIN_EXPECTED && audioSec < expectedSec * COVERAGE;
                   const retried     = ch.audioRetryCount || 0;
   
-                  if (tooShort && retried < 2) {
+                  if (tooShort && retried < 3) {
                     ch.audioRetryCount = retried + 1;
                     sipMap.set(channelId, ch);
   
@@ -1384,6 +1591,13 @@ function pushTranscript(role, text) {
             ch.transcriptWindow = ch.transcriptWindow || [];
             ch.transcriptWindow.push({ role: 'user', text, t: Date.now() });
             if (ch.transcriptWindow.length > 10) ch.transcriptWindow.shift();
+            if (!ch.lastDirection) {
+              const earlyDir = detectDirection(text);
+              if (earlyDir) {
+                ch.lastDirection = earlyDir;
+                logger.info(`[DIRECTION] раннее определение "${earlyDir}" из речи клиента для ${channelId}`);
+              }
+            }
             sipMap.set(channelId, ch);
 
             ch = sipMap.get(channelId);
@@ -1453,6 +1667,12 @@ function pushTranscript(role, text) {
             break;
           }
 
+          if (msg.includes('Cancellation failed') || msg.includes('no active response')) {
+            isResponseActive = false;
+            flushResponseQueue();
+            break;
+          }
+
           ws.close();
           break;
         }
@@ -1516,15 +1736,15 @@ const tools = [
             'Мелкобытовой сервис',
             'Ремонт квартир',
             'Сантехника',
-            'Вывоз мусора партнеры',
+            'Вывоз мусора',
             'Уборка',
             'Электрика',
-            'Вскрытие замков',
+            'Вскрытие и установка замков',
             'Окна'
           ]
         },
         circumstances:{ type: 'string', description: 'Подробности неисправности / обращения' },
-        brand:       { type: 'string',  description: 'Бренд и модель ТОЛЬКО если техника, одной строкой' },
+        brand:       { type: 'string',  description: 'Бренд / модель - если техника, одной строкой' },
         phone: {
   type: 'string',
   description: 'Контактный телефон в формате +7XXXXXXXXXX',
@@ -1586,9 +1806,9 @@ const tools = [
             'Холодильники', 'Кондиционеры', 'Телевизоры', 'Стиральные машины',
             'Посудомоечные машины','Швейные машины','Кофемашины','Плиты',
             'Микроволновки','Вытяжки','Компьютеры','Гаджеты','Промышленный холод',
-            'Газовые колонки','Установка','Пылесосы','Клининг','Дезинсекция',
+            'Газовые колонки','Установка','Клининг','Дезинсекция',
             'Натяжные потолки','Мелкобытовой сервис','Ремонт квартир','Сантехника',
-            'Вывоз мусора','Уборка','Электрика','Окна','Вскрытие замков'
+            'Вывоз мусора','Уборка','Электрика','Окна','Вскрытие и установка замков'
           ]
         }
       }
@@ -1670,6 +1890,7 @@ const tools = [
           sipMap.set(channelId, channelData);
 
           const itemId = uuid().replace(/-/g, '').substring(0, 32);
+          initialGreetingItemId = itemId;
           logClient(`Sending initial message for ${channelId}: ${config.INITIAL_MESSAGE || 'Здравствуйте! Я голосовой помощник сервисного центра. Оформляю заявку на выезд мастера'}`);
           ws.send(JSON.stringify({
             type: 'conversation.item.create',

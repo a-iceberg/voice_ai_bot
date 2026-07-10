@@ -1,0 +1,16 @@
+{
+    "requestList": {
+        "id": "",
+        "site": "voice_bot",
+        "customer_phone": "",
+        "customer_name": "",
+        "customer_message": "",
+        "city": "msk",
+        "tracking_phone": "",
+        "utm_source": "",
+        "utm_source_vendor": "voice_bot",
+        "id_vendor": "",
+        "model": "",
+        "direction": ""
+    }
+}

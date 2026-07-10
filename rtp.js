@@ -150,6 +150,24 @@ async function streamAudio(channelId, rtpSource) {
   rtpSender.isOpen = true;
   rtpSenders.set(channelId, rtpSender);
 
+  const KEEPALIVE_INTERVAL_MS = 1000;
+  const keepaliveSamples = (KEEPALIVE_INTERVAL_MS / 20) * samplesPerPacket;
+  const silencePayload = Buffer.alloc(samplesPerPacket, 0xFF);
+  const keepaliveId = setInterval(() => {
+    if (isSocketClosed || !sipMap.has(channelId)) return;
+    if (intervalId) return;
+    if (packetQueue.length > 0) return;
+    const channelData = sipMap.get(channelId) || {};
+    const sendPort = channelData.rtpSource ? channelData.rtpSource.port : rtpSource.port;
+    const sendAddress = channelData.rtpSource ? channelData.rtpSource.address : rtpSource.address;
+    const header = buildRTPHeader(rtpSequence, rtpTimestamp, rtpSsrc);
+    rtpSequence = (rtpSequence + 1) % 65536;
+    rtpTimestamp += keepaliveSamples;
+    rtpSender.send(Buffer.concat([header, silencePayload]), sendPort, sendAddress, (err) => {
+      if (err) logger.error(`Error sending RTP keepalive for ${channelId}: ${err.message}`);
+    });
+  }, KEEPALIVE_INTERVAL_MS);
+
   function writeAudio(data) {
     if (data.length === 0 || data.every(byte => byte === 0x7F)) {
       logger.warn(`Received empty or silent audio for ${channelId}`);
@@ -287,6 +305,9 @@ async function streamAudio(channelId, rtpSource) {
   function endStream() {
     const avgPtime = ptimeStats.count > 0 ? (ptimeStats.sum / ptimeStats.count).toFixed(2) : 'N/A';
     logger.info(`RTP stream ended for ${channelId}, total packets sent: ${totalPacketsSent}, total bytes: ${totalBytesSent}, final buffer: ${audioBuffer.length} bytes, avg ptime: ${avgPtime}ms`);
+    if (keepaliveId) {
+      clearInterval(keepaliveId);
+    }
     if (intervalId) {
       clearInterval(intervalId);
       intervalId = null;

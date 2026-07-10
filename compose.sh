@@ -8,6 +8,3 @@ docker compose down
 
 echo "[2/3] Сбор образа и запуск сервиса..."
 docker compose up --build -d --remove-orphans --force-recreate
-
-echo "[3/3] Готово. Логи:"
-docker compose logs -f
