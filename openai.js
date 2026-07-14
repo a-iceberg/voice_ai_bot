@@ -7,6 +7,8 @@ const { streamAudio, rtpEvents } = require('./rtp');
 const { handoffToOperator } = require('./asterisk');
 const { findNearestAffilate, classifyZone, cityFromAffilate } = require('./address_zoning');
 const { ProxyAgent, fetch: undiciFetch } = require('undici');
+const fs = require('fs');
+const path = require('path');
 
 logger.info('Loading openai.js module');
 
@@ -22,6 +24,55 @@ if (DD_PROXY_DISPATCHER) {
 //-----------------------------
 const { DateTime } = require("luxon");
 const TZ = "Europe/Moscow";
+
+let globalBotCharsPerSec = null;
+
+const BOT_RATE_FILE = path.join(__dirname, 'data', 'bot_rate.json');
+const BOT_RATE_SAVE_INTERVAL_MS = 30000;
+let botRateLastSaveAt = 0;
+let botRateSaveTimer = null;
+
+function loadGlobalBotRate() {
+  try {
+    const obj = JSON.parse(fs.readFileSync(BOT_RATE_FILE, 'utf8'));
+    const v = Number(obj?.botCharsPerSec);
+    if (Number.isFinite(v) && v >= 12 && v <= 24) {
+      globalBotCharsPerSec = v;
+      logger.info(`[RESPEAK] Загружен глобальный темп бота с диска: ${v.toFixed(2)} симв/сек`);
+    }
+  } catch (e) {
+    if (e.code !== 'ENOENT') logger.warn(`[RESPEAK] Не удалось прочитать ${BOT_RATE_FILE}: ${e.message}`);
+  }
+}
+
+function writeGlobalBotRateNow() {
+  botRateLastSaveAt = Date.now();
+  if (globalBotCharsPerSec == null) return;
+  try {
+    const tmp = BOT_RATE_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify({
+      botCharsPerSec: Number(globalBotCharsPerSec.toFixed(3)),
+      updatedAt: new Date().toISOString(),
+    }));
+    fs.renameSync(tmp, BOT_RATE_FILE); // атомарная подмена
+  } catch (e) {
+    logger.warn(`[RESPEAK] Не удалось сохранить темп бота: ${e.message}`);
+  }
+}
+
+function scheduleGlobalBotRateSave() {
+  const since = Date.now() - botRateLastSaveAt;
+  if (since >= BOT_RATE_SAVE_INTERVAL_MS) {
+    writeGlobalBotRateNow();
+  } else if (!botRateSaveTimer) {
+    botRateSaveTimer = setTimeout(() => {
+      botRateSaveTimer = null;
+      writeGlobalBotRateNow();
+    }, BOT_RATE_SAVE_INTERVAL_MS - since);
+  }
+}
+
+loadGlobalBotRate();
 
 let DID_CITY = { default: 'msk', map: {} };
 try {
@@ -100,6 +151,29 @@ function buildSystemPromptFinal() {
   return lines.join("\n\n");
 }
 
+function buildAudioConfig(silenceMs) {
+  return {
+    input: {
+      format: { type: 'audio/pcmu' },
+      transcription: {
+        model: 'gpt-4o-transcribe',
+        language: 'ru',
+      },
+      turn_detection: {
+        type: 'server_vad',
+        threshold: config.VAD_THRESHOLD || 0.7,
+        prefix_padding_ms: config.VAD_PREFIX_PADDING_MS || 300,
+        silence_duration_ms: silenceMs,
+        create_response: true,
+      },
+    },
+    output: {
+      format: { type: 'audio/pcmu' },
+      voice: config.OPENAI_VOICE || 'cedar',
+    },
+  };
+}
+
 function formatRuDateSpeech(iso) {
   if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(String(iso))) return iso;
   return DateTime.fromISO(String(iso), { zone: TZ })
@@ -144,6 +218,7 @@ function hasCorrectionIntent(text) {
   return CORRECTION_PATTERNS.some(rx => rx.test(t));
 }
 
+/** @type {[RegExp, string][]} */
 const DIRECTION_KEYWORDS = [
   [/посудомо|посудомойк/i, 'Посудомоечные машины'],
   [/стиральн|стиралк/i, 'Стиральные машины'],
@@ -970,6 +1045,14 @@ function pushTranscript(role, text) {
     }
   }
 
+  function sendVadSilenceUpdate(silenceMs) {
+    if (!ws || ws.readyState !== ws.OPEN) return;
+    ws.send(JSON.stringify({
+      type: 'session.update',
+      session: { type: 'realtime', audio: buildAudioConfig(silenceMs) },
+    }));
+  }
+
 
   const processMessage = async (response) => {
     try {
@@ -983,9 +1066,16 @@ function pushTranscript(role, text) {
         case 'input_audio_buffer.speech_started':
           logOpenAI(`Client speech started for ${channelId}`);
           noteClientActivity();
+          if (channelData) {
+            channelData.clientSpeechStartedAt = Date.now();
+            channelData.clientSpeechStoppedAt = null;
+          }
           if (streamHandler) {
             try { streamHandler.stopPlayback(); } catch {}
           }
+          break;
+        case 'input_audio_buffer.speech_stopped':
+          if (channelData) channelData.clientSpeechStoppedAt = Date.now();
           break;
         case 'conversation.item.added':
           logOpenAI(`Conversation item added for ${channelId}`);
@@ -1126,16 +1216,72 @@ function pushTranscript(role, text) {
               logger.info(`[ADDRESS] function_call attempt ${ch.retryCounters.address}: ${typeof args === 'string' ? args : JSON.stringify(args)}`);
 
               if (ch.retryCounters.address > config.MAX_VALIDATION_RETRIES) {
-                logger.warn(`[ADDRESS] Max retries reached for ${channelId}, skipping validation`);
-                enqueueResponseCreate({
-                  output_modalities: ['audio'],
-                  instructions: 'Не могу точно определить ваш адрес. Сейчас переведу вас на оператора, ожидайте, пожалуйста, на линии.'
-                });
+                logger.warn(`[ADDRESS] Max retries reached for ${channelId} — перевод на оператора`);
                 ch.retryCounters.address = 0;
                 sipMap.set(channelId, ch);
 
-                toolResult = JSON.stringify({ ok: true, skipped: true });
-                sendFunctionResult(ws, call_id, toolResult, enqueueResponseCreate, { createResponse: false });
+                // Нерабочие часы: перевод недоступен — заявка на обратный звонок
+                if (isOperatorOffHours()) {
+                  logger.info(`[HANDOFF] off-hours (МСК) — перевод пропущен, создаю заявку на обратный звонок | channel=${channelId}`);
+                  sendFunctionResult(
+                    ws,
+                    call_id,
+                    JSON.stringify({ ok: true, handoff: 'skipped', reason: 'operator_off_hours' }),
+                    enqueueResponseCreate,
+                    { createResponse: false }
+                  );
+                  requestCallbackTask();
+                  enqueueResponseCreate({
+                    output_modalities: ['audio'],
+                    instructions: OPERATOR_OFFHOURS_INSTRUCTION
+                  });
+                  continue;
+                }
+
+                // 1) флаг, чтобы cleanup не повесил трубку
+                ch.handoffToOperator = true;
+                sipMap.set(channelId, ch);
+
+                // 2) гасим текущую речь модели/плейбек
+                try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+                try { if (ch.streamHandler) ch.streamHandler.stopPlayback(); } catch {}
+
+                // 3) реально переводим в диалплан
+                try {
+                  await handoffToOperator(channelId, { context: 'from-TRUNK-MSK-RUS', exten: '1200', priority: 1 });
+                  logger.info(`[HANDOFF] continueInDialplan OK (address max-retries) | channel=${channelId} -> from-TRUNK-MSK-RUS,1200,1`);
+
+                  sendFunctionResult(
+                    ws,
+                    call_id,
+                    JSON.stringify({ ok: true, handoff: 'started', reason: 'address_max_retries', target: 'from-TRUNK-MSK-RUS/1200' }),
+                    enqueueResponseCreate,
+                    { createResponse: false }
+                  );
+
+                  try { ws.close(); } catch {}
+                } catch (e) {
+                  logger.error(`[HANDOFF] continueInDialplan FAILED (address max-retries) | channel=${channelId} | ${e.message}`);
+
+                  ch = sipMap.get(channelId) || {};
+                  ch.handoffToOperator = false;
+                  sipMap.set(channelId, ch);
+
+                  sendFunctionResult(
+                    ws,
+                    call_id,
+                    JSON.stringify({ ok: false, error: e.message }),
+                    enqueueResponseCreate,
+                    { createResponse: false }
+                  );
+
+                  enqueueResponseCreate({
+                    output_modalities: ['audio'],
+                    instructions: 'Не получилось перевести на оператора. Давайте продолжим здесь: уточните, пожалуйста, ваш адрес ещё раз.'
+                  });
+                }
+
+                continue;
               } else {
                 if (!a.direction && ch.lastDirection) {
                   a.direction = ch.lastDirection;
@@ -1520,22 +1666,25 @@ function pushTranscript(role, text) {
                 if (ch) {
                   const audioBytes  = ch.lastAudioBytes || 0;
                   const audioSec    = audioBytes / 8000;
-                  const expectedSec = (text || '').trim().length / 18;
-                  const COVERAGE    = 0.8;
-                  const MIN_EXPECTED = 10.0;
+                  const trimmedLen  = (text || '').trim().length;
+                  const RATE_DEFAULT = config.RESPEAK_RATE_DEFAULT || 18;
+                  const charsPerSec = globalBotCharsPerSec || RATE_DEFAULT;
+                  const expectedSec = trimmedLen / charsPerSec;
+                  const COVERAGE    = config.RESPEAK_COVERAGE || 0.8;
+                  const MIN_EXPECTED = config.RESPEAK_MIN_EXPECTED_SEC || 10.0;
                   const tooShort    = expectedSec >= MIN_EXPECTED && audioSec < expectedSec * COVERAGE;
                   const retried     = ch.audioRetryCount || 0;
-  
+
                   if (tooShort && retried < 3) {
                     ch.audioRetryCount = retried + 1;
                     sipMap.set(channelId, ch);
-  
+
                     logger.warn(
                       `[RE-SPEAK] Short audio (${audioSec.toFixed(2)}s) for ` +
-                      `${expectedSec.toFixed(1)}s of transcript on ${channelId}, ` +
+                      `${expectedSec.toFixed(1)}s of transcript (rate≈${charsPerSec.toFixed(1)} chars/s) on ${channelId}, ` +
                       `requesting re-speak (attempt ${ch.audioRetryCount})`
                     );
-  
+
                     enqueueResponseCreate({
                       output_modalities: ['audio'],
                       instructions:
@@ -1544,10 +1693,19 @@ function pushTranscript(role, text) {
                     });
                     break;
                   }
-  
+
                   if (!tooShort && retried) {
                     ch.audioRetryCount = 0;
                     sipMap.set(channelId, ch);
+                  }
+
+                  if (!tooShort && audioSec >= 3 && trimmedLen >= 30) {
+                    const observed = Math.max(14, Math.min(22, trimmedLen / audioSec));
+                    const alpha = 0.25;
+                    globalBotCharsPerSec = globalBotCharsPerSec
+                      ? (1 - alpha) * globalBotCharsPerSec + alpha * observed
+                      : observed;
+                    scheduleGlobalBotRateSave();
                   }
                 }
   
@@ -1599,6 +1757,43 @@ function pushTranscript(role, text) {
               }
             }
             sipMap.set(channelId, ch);
+
+            {
+              const startedAt = ch.clientSpeechStartedAt;
+              const stoppedAt = ch.clientSpeechStoppedAt;
+              const curSilence = ch.appliedSilenceMs || (config.VAD_SILENCE_DURATION_MS || 1200);
+              if (startedAt && stoppedAt && stoppedAt > startedAt) {
+                const rawMs = stoppedAt - startedAt;
+                const speechMs = rawMs - curSilence;
+                const len = (text || '').trim().length;
+                if (speechMs >= 600 && len >= 12) {
+                  const observed = Math.max(12, Math.min(24, len / (speechMs / 1000)));
+                  const alpha = 0.3;
+                  ch.clientCharsPerSec = ch.clientCharsPerSec
+                    ? (1 - alpha) * ch.clientCharsPerSec + alpha * observed
+                    : observed;
+
+                  const CLIENT_RATE_REF = config.VAD_CLIENT_RATE_REF || 14;
+                  const SIL_MIN = config.VAD_SILENCE_MIN_MS || 600;
+                  const SIL_MAX = config.VAD_SILENCE_MAX_MS || 1800;
+                  const base = config.VAD_SILENCE_DURATION_MS || 1200;
+                  let target = Math.round((base * (CLIENT_RATE_REF / ch.clientCharsPerSec)) / 50) * 50;
+                  target = Math.max(SIL_MIN, Math.min(SIL_MAX, target));
+
+                  if (Math.abs(target - curSilence) >= 200) {
+                    ch.appliedSilenceMs = target;
+                    sendVadSilenceUpdate(target);
+                    logger.info(
+                      `[VAD] client rate≈${ch.clientCharsPerSec.toFixed(1)} chars/s -> ` +
+                      `silence_duration_ms ${curSilence}→${target} for ${channelId}`
+                    );
+                  }
+                }
+                ch.clientSpeechStartedAt = null;
+                ch.clientSpeechStoppedAt = null;
+                sipMap.set(channelId, ch);
+              }
+            }
 
             ch = sipMap.get(channelId);
             if (ch?.slots && ch.slots.address.validated && hasCorrectionIntent(text)) {
@@ -1849,26 +2044,7 @@ const tools = [
             type: 'realtime',
             instructions: sessionInstructions,
             output_modalities: ['audio'],
-            audio: {
-              input: {
-                format: { type: 'audio/pcmu' },
-                transcription: {
-                  model: 'gpt-4o-transcribe',
-                  language: 'ru'
-                },
-                turn_detection: {
-                  type: 'server_vad',
-                  threshold: config.VAD_THRESHOLD || 0.6,
-                  prefix_padding_ms: config.VAD_PREFIX_PADDING_MS || 200,
-                  silence_duration_ms: config.VAD_SILENCE_DURATION_MS || 600,
-                  create_response: true
-                }
-              },
-              output: {
-                format: { type: 'audio/pcmu' },
-                voice: config.OPENAI_VOICE || 'cedar'
-              }
-            },
+            audio: buildAudioConfig(config.VAD_SILENCE_DURATION_MS || 1200),
             include: ["item.input_audio_transcription.logprobs"],
             tools,
             tool_choice: 'auto'
@@ -1887,6 +2063,7 @@ const tools = [
           phone:   { required: true, validated: !!callerNorm, pendingTool: null },
           address: { required: true, validated: false, pendingTool: null },
           };
+          channelData.appliedSilenceMs = config.VAD_SILENCE_DURATION_MS || 1200;
           sipMap.set(channelId, channelData);
 
           const itemId = uuid().replace(/-/g, '').substring(0, 32);

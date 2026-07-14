@@ -30,19 +30,25 @@ const config = {
   OPENAI_VOICE: process.env.OPENAI_VOICE || 'cedar',
   RTP_PORT_START: 12000,
   MAX_CONCURRENT_CALLS: parseInt(process.env.MAX_CONCURRENT_CALLS) || 20,
-  VAD_THRESHOLD: parseFloat(process.env.VAD_THRESHOLD) || 0.6,
-  VAD_PREFIX_PADDING_MS: Number(process.env.VAD_PREFIX_PADDING_MS) || 200,
-  VAD_SILENCE_DURATION_MS: Number(process.env.VAD_SILENCE_DURATION_MS) || 600,
+  VAD_THRESHOLD: parseFloat(process.env.VAD_THRESHOLD) || 0.7,
+  VAD_PREFIX_PADDING_MS: Number(process.env.VAD_PREFIX_PADDING_MS) || 300,
+  VAD_SILENCE_DURATION_MS: Number(process.env.VAD_SILENCE_DURATION_MS) || 1200,
   LOG_LEVEL: process.env.LOG_LEVEL || 'info',
   SYSTEM_PROMPT: process.env.SYSTEM_PROMPT,
-  INITIAL_MESSAGE: process.env.INITIAL_MESSAGE || 'Здравствуйте! Я голосовой ассистент приема заявок компании Айсберг',
+  INITIAL_MESSAGE: process.env.INITIAL_MESSAGE || 'Здравствуйте! Я голосовой помощник сервисного центра. Оформляю заявку на выезд мастера',
   SILENCE_PADDING_MS: parseInt(process.env.SILENCE_PADDING_MS) || 100,
   CALL_DURATION_LIMIT_SECONDS: parseInt(process.env.CALL_DURATION_LIMIT_SECONDS) || 0, // 0 means no limit
   MAX_VALIDATION_RETRIES: parseInt(process.env.MAX_VALIDATION_RETRIES) || 2,
   SILENCE_GREETING_TIMEOUT_SEC: parseInt(process.env.SILENCE_GREETING_TIMEOUT_SEC) || 30,
   SILENCE_CONVO_TIMEOUT_SEC: parseInt(process.env.SILENCE_CONVO_TIMEOUT_SEC) || 30,
   SILENCE_CONTINUE_WAIT_SEC: parseInt(process.env.SILENCE_CONTINUE_WAIT_SEC) || 120,
-  SILENCE_INAUDIBLE_HANGUP_SEC: parseInt(process.env.SILENCE_INAUDIBLE_HANGUP_SEC) || 5
+  SILENCE_INAUDIBLE_HANGUP_SEC: parseInt(process.env.SILENCE_INAUDIBLE_HANGUP_SEC) || 5,
+  RESPEAK_COVERAGE: parseFloat(process.env.RESPEAK_COVERAGE) || 0.8,
+  RESPEAK_MIN_EXPECTED_SEC: parseFloat(process.env.RESPEAK_MIN_EXPECTED_SEC) || 10.0,
+  RESPEAK_RATE_DEFAULT: parseFloat(process.env.RESPEAK_RATE_DEFAULT) || 18,
+  VAD_CLIENT_RATE_REF: parseFloat(process.env.VAD_CLIENT_RATE_REF) || 14,
+  VAD_SILENCE_MIN_MS: Number(process.env.VAD_SILENCE_MIN_MS) || 600,
+  VAD_SILENCE_MAX_MS: Number(process.env.VAD_SILENCE_MAX_MS) || 1800
 };
 
 let sentEventCounter = 0;
