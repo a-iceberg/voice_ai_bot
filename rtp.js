@@ -62,6 +62,11 @@ function startRTPReceiver(channelId, port) {
     const rtpReceiver = dgram.createSocket({ type: 'udp4', reuseAddr: true });
     rtpReceiver.isOpen = false;
     let settled = false;
+
+    let rxPackets = 0;
+    let rxDroppedNoWs = 0;
+    let rxLastSecond = Date.now();
+    let rxLastDropLog = 0;
     rtpReceiver.once('listening', () => {
       rtpReceiver.isOpen = true;
       rtpReceivers.set(channelId, rtpReceiver);
@@ -78,12 +83,27 @@ function startRTPReceiver(channelId, port) {
         sipMap.set(channelId, channelData);
         logger.info(`RTP source assigned for ${channelId}: ${rinfo.address}:${rinfo.port}`);
       }
+      rxPackets++;
+      const now = Date.now();
+      if (now - rxLastSecond >= 10000) {
+        logger.info(`Incoming packets per second for ${channelId}: ${(rxPackets / 10).toFixed(2)}`);
+        rxPackets = 0;
+        rxLastSecond = now;
+      }
+
       if (channelData && channelData.ws && channelData.ws.readyState === 1) {
         const muLawData = msg.slice(12);
         channelData.ws.send(JSON.stringify({
           type: 'input_audio_buffer.append',
           audio: muLawData.toString('base64')
         }));
+      } else {
+        rxDroppedNoWs++;
+        if (now - rxLastDropLog >= 1000) {
+          const wsState = channelData && channelData.ws ? channelData.ws.readyState : 'no-ws';
+          logger.warn(`Dropping incoming RTP for ${channelId}: ws.readyState=${wsState}, dropped so far: ${rxDroppedNoWs}`);
+          rxLastDropLog = now;
+        }
       }
     });
     rtpReceiver.on('error', (err) => {
