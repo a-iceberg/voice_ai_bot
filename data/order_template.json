@@ -25,7 +25,8 @@
         "client": {
             "display_name": "Не названо",
             "phone": "",
-            "phoneIncoming": ""
+            "phoneIncoming": "",
+            "phoneBot": ""
         },
         "address": {
             "uri": "",

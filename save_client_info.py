@@ -15,7 +15,6 @@ from datetime import datetime
 
 # Базовые пути
 BASE_DIR = Path(__file__).resolve().parent
-
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -143,6 +142,7 @@ def build_order(client: dict) -> dict:
     order["order"]["client"]["display_name"] = client.get("name", "")
     order["order"]["client"]["phone"]        = client.get("phone", "")
     order["order"]["client"]["phoneIncoming"] = client.get("phone2", "")
+    order["order"]["client"]["phoneBot"] = client.get("phoneBot", "")
 
     # адрес
     addr = client.get("address", {}) or {}
@@ -159,9 +159,6 @@ def build_order(client: dict) -> dict:
     order["order"]["address"]["intercom"]  = addr.get("intercom", "")
 
     order["order"]["multipleRequest"] = bool(client.get("multipleRequest", order["order"].get("multipleRequest", False)))
-
-    # номер, НА который позвонил клиент (DID / набранная линия)
-    order["order"]["phoneBot"] = client.get("phoneBot", "")
 
     # name_components.locality — только город филиала (для маршрутизации в 1С)
     city = filial_city
@@ -237,9 +234,9 @@ def send_order(uid: str, order: dict) -> None:
         return (order["order"]["address"].get("name") or "").split(",")[0].strip()
 
     city = _get_locality(order)
-    if "Санкт" in city or "Петербург" in city or "СПб" in city:
+    if "санкт" in city.lower() or "петербург" in city.lower():
         cp = "spb"
-    elif "Москва" in city or "Моск" in city:
+    elif "москва" in city.lower():
         cp = "msk"
     else:
         cp = "reg"
