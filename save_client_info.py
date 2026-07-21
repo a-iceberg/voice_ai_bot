@@ -149,7 +149,6 @@ def build_order(client: dict) -> dict:
     spoken_city = (addr.get("spoken_city") or "").strip()
     filial_city = (addr.get("city") or "").strip()
 
-    # address.name — реальный адрес клиента (из DaData), не город филиала
     addr_for_name = dict(addr)
     addr_for_name["city"] = spoken_city or filial_city
     order["order"]["address"]["name"]      = russian_address(addr_for_name)

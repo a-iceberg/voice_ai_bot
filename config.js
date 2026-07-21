@@ -48,7 +48,10 @@ const config = {
   RESPEAK_RATE_DEFAULT: parseFloat(process.env.RESPEAK_RATE_DEFAULT) || 18,
   VAD_CLIENT_RATE_REF: parseFloat(process.env.VAD_CLIENT_RATE_REF) || 14,
   VAD_SILENCE_MIN_MS: Number(process.env.VAD_SILENCE_MIN_MS) || 600,
-  VAD_SILENCE_MAX_MS: Number(process.env.VAD_SILENCE_MAX_MS) || 1800
+  VAD_SILENCE_MAX_MS: Number(process.env.VAD_SILENCE_MAX_MS) || 1800,
+  RAG_ENABLED: String(process.env.RAG_ENABLED || 'true').toLowerCase() === 'true',
+  RAG_URL: process.env.RAG_URL || 'http://127.0.0.1:7420',
+  RAG_TIMEOUT_MS: Number(process.env.RAG_TIMEOUT_MS) || 5000,
 };
 
 let sentEventCounter = 0;

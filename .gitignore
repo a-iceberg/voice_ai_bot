@@ -7,6 +7,10 @@ data/config.json
 .env
 env_example
 
+vector_db_cache/bm25s_index/
+vector_db_cache/bm25s_metadata.json
+vector_db_cache/hashes.json
+
 
 order_sent*
 save_client_info.log

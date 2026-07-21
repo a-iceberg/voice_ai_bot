@@ -6,6 +6,7 @@ const { sipMap, cleanupPromises, extMap } = require('./state');
 const { streamAudio, rtpEvents } = require('./rtp');
 const { handoffToOperator } = require('./asterisk');
 const { findNearestAffilate, classifyZone, cityFromAffilate } = require('./address_zoning');
+const { buildTurnInstructions, previewText } = require('./rag');
 const { ProxyAgent, fetch: undiciFetch } = require('undici');
 const fs = require('fs');
 const path = require('path');
@@ -164,7 +165,7 @@ function buildAudioConfig(silenceMs) {
         threshold: config.VAD_THRESHOLD || 0.7,
         prefix_padding_ms: config.VAD_PREFIX_PADDING_MS || 300,
         silence_duration_ms: silenceMs,
-        create_response: true,
+        create_response: false,
       },
     },
     output: {
@@ -446,7 +447,6 @@ async function handleValidatePhone(call, ws, logger) {
     }
   }
 }
-/** Сохраняет результат validate_address на канале для озвучки (spoken_city) vs 1С (system_city). */
 function applyLastValidatedAddress(ch, normalized) {
   if (!normalized) return ch;
   ch = ch || {};
@@ -456,6 +456,8 @@ function applyLastValidatedAddress(ch, normalized) {
     street: normalized.street || '',
     house_number: normalized.house_number || '',
     display_name: normalized.display_name || '',
+    latitude: normalized.latitude,
+    longitude: normalized.longitude,
     timezone: normalized.timezone || '',
     affilate: normalized.affilate || '',
   };
@@ -578,17 +580,16 @@ async function runValidateAddress(args) {
   const { zone } = classifyZone({ affilate, distance, direction });
   const localityCity = cityFromAffilate(affilate);
 
-  // Реальный город/населённый пункт из ответа DaData — для озвучки клиенту.
-  // localityCity — это «филиальный» город (для маршрутизации заявки в 1С),
-  // он может отличаться от реального (например, «Москва» вместо «Долгопрудный»).
   const dd = pick.data || {};
   const spokenCity = String(
     dd.city || dd.settlement || dd.area || dd.region || city || ''
   ).trim();
+  const ddStreet = String(dd.street_with_type || dd.street || street || '').trim();
+  const ddHouse = String(dd.house || house || '').trim();
   const ddTimezone = await fetchDaDataTimezone(display_name);
 
   logger.info(
-    `[ADDRESS] DaData OK: "${display_name}" (${latitude},${longitude}) | nearest=${affilate || 'none'} | dist=${Number.isFinite(distance) ? distance.toFixed(2) : 'inf'}km | direction="${direction}" | zone=${zone} | spoken_city="${spokenCity}"`
+    `[ADDRESS] DaData OK: "${display_name}" (${latitude},${longitude}) | nearest=${affilate || 'none'} | dist=${Number.isFinite(distance) ? distance.toFixed(2) : 'inf'}km | direction="${direction}" | zone=${zone} | spoken_city="${spokenCity}" | street="${ddStreet}" house="${ddHouse}"`
   );
 
   if (zone === 'out_of_service') {
@@ -604,8 +605,8 @@ async function runValidateAddress(args) {
   const normalized = {
     city: localityCity,
     spoken_city: spokenCity,
-    street,
-    house_number: house,
+    street: ddStreet,
+    house_number: ddHouse,
     latitude,
     longitude,
     display_name,
@@ -845,9 +846,12 @@ function pushTranscript(role, text) {
       const addrCity = addr.affilate ? (String(addr.affilate).split('_')[1] || '') : '';
       const cityCode = addrCity || cityByDid(ch.phoneBot);
 
-      const clientMessage = (ch.transcriptWindow || [])
-        .filter(x => x && x.role === 'user' && x.text)
-        .map(x => String(x.text).trim())
+      const dialogMessage = (ch.transcriptWindow || [])
+        .filter(x => x && x.text && (x.role === 'user' || x.role === 'assistant'))
+        .map(x => {
+          const who = x.role === 'user' ? 'Клиент' : 'Ассистент';
+          return `${who}: ${String(x.text).trim()}`;
+        })
         .filter(Boolean)
         .join('; ');
 
@@ -858,7 +862,7 @@ function pushTranscript(role, text) {
         brand: ch.lastBrand || '',
         circumstances: ch.lastCircumstances || '',
         comment: ch.lastComment || '',
-        message: clientMessage,
+        message: dialogMessage,
         city: cityCode,
         did: ch.phoneBot || '',
       };
@@ -1003,6 +1007,17 @@ function pushTranscript(role, text) {
 
     isResponseActive = true;
     lastResponseCreateAt = Date.now();
+
+    const chNow = sipMap.get(channelId) || {};
+    const explicit = payload.instructions != null && String(payload.instructions).length > 0;
+    const effectiveInstructions = explicit
+      ? String(payload.instructions)
+      : String(chNow.sessionInstructions || chNow.baseSessionInstructions || '');
+    const source = explicit ? 'response.create' : 'session';
+    logger.info(
+      `[INSTRUCTIONS] ${channelId} source=${source} chars=${effectiveInstructions.length} ` +
+      `preview: ${previewText(effectiveInstructions)}`
+    );
 
     ws.send(JSON.stringify({
       type: 'response.create',
@@ -1466,19 +1481,20 @@ function pushTranscript(role, text) {
                 phone2: additionalPhone,
                 address: {
                   // city — город филиала для 1С (name_components, маршрутизация)
-                  city: a.address?.city,
-                  // spoken_city — реальный НП из DaData для address.name и логов
+                  city: validatedAddr?.system_city || a.address?.city,
+                  // spoken_city — только для озвучки/подтверждения клиенту
                   spoken_city: validatedAddr?.spoken_city
                     || a.address?.spoken_city
                     || '',
-                  street: a.address?.street,
-                  house_number: a.address?.house_number,
+                  // street/house/координаты — из успешной валидации DaData
+                  street: validatedAddr?.street || a.address?.street,
+                  house_number: validatedAddr?.house_number || a.address?.house_number,
                   apartment: a.address?.apartment || '',
                   entrance: a.address?.entrance || '',
                   floor: a.address?.floor || '',
                   intercom: a.address?.intercom || '',
-                  latitude: a.address?.latitude,
-                  longitude: a.address?.longitude
+                  latitude: validatedAddr?.latitude ?? a.address?.latitude,
+                  longitude: validatedAddr?.longitude ?? a.address?.longitude
                 },
                 date: visitDate,
                 comment: a.comment || '',
@@ -1796,6 +1812,7 @@ function pushTranscript(role, text) {
             }
 
             ch = sipMap.get(channelId);
+            let correctionHandled = false;
             if (ch?.slots && ch.slots.address.validated && hasCorrectionIntent(text)) {
               const mentionsPhone = /телефон|номер/i.test(text);
               const mentionsAddr = /адрес|город|улиц|дом|кварт|подъезд|этаж|домофон/i.test(text);
@@ -1807,18 +1824,53 @@ function pushTranscript(role, text) {
                 ch.slots.address.validated = false;
                 ch.slots.address.pendingTool = null;
                 sipMap.set(channelId, ch);
-                try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+                correctionHandled = true;
                 enqueueResponseCreate({
                   output_modalities: ['audio'],
                   instructions: 'Давайте ещё раз: город, улица, дом — продиктуйте, пожалуйста, полностью. Я проверю адрес и повторю вам итог.'
                 });
               } else if (target === 'phone') {
-                try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+                correctionHandled = true;
                 enqueueResponseCreate({
                   output_modalities: ['audio'],
                   instructions: 'Хорошо, продиктуйте, пожалуйста, контактный номер полностью, сейчас именно по одной цифре, начиная с +7 — я проверю и сразу повторю вам то, что записал.'
                 });
               }
+            }
+
+            if (!correctionHandled) {
+              ch = sipMap.get(channelId) || {};
+              ch.ragTurnSeq = (ch.ragTurnSeq || 0) + 1;
+              const mySeq = ch.ragTurnSeq;
+              sipMap.set(channelId, ch);
+
+              const lastBot = [...(ch.transcriptWindow || [])]
+                .reverse()
+                .find((t) => t.role === 'assistant');
+              const ragQuery = [lastBot?.text, text].filter(Boolean).join('\n');
+              const base = ch.baseSessionInstructions || '';
+
+              const { instructions, ragContext } = await buildTurnInstructions({
+                baseInstructions: base,
+                query: ragQuery || text,
+              });
+
+              const chAfter = sipMap.get(channelId);
+              if (!chAfter || chAfter.ragTurnSeq !== mySeq) {
+                logger.info(`[RAG] stale turn seq=${mySeq} for ${channelId}, skip response.create`);
+                break;
+              }
+              if (!ws || ws.readyState !== ws.OPEN) break;
+
+              chAfter.lastRagContext = ragContext || '';
+              chAfter.lastRagQuery = ragQuery || text;
+              chAfter.sessionInstructions = base;
+              sipMap.set(channelId, chAfter);
+
+              enqueueResponseCreate({
+                output_modalities: ['audio'],
+                instructions,
+              });
             }
           }
           break;
@@ -1963,7 +2015,7 @@ const tools = [
           }
         },
         date:   { type: 'string', description: 'Желаемая дата визита (YYYY-MM-DD). Конвертируй относительные фразы на основе текущей даты из системного сообщения.', pattern: '^\\d{4}-\\d{2}-\\d{2}$' },
-        comment: { type: 'string', description: 'Дополнительный комментарий' },
+        comment: { type: 'string', description: 'Любая дополнительная информация от самого клиента, например, про удобное время звонка или визита' },
         multiple_request: { type: 'boolean', default: false, description: 'True, если клиент говорил о нескольких поломках/единицах ТЕХНИКИ (в том числе в направлении Установка) именно при одинаковом направлении для нескольких отдельных заявок, и False, если есть только единичная заявка для одной единицы техники, или же клиент говорил о разных запросах в рамках одного направления именно уже УСЛУГ' }
       }
     }
@@ -2064,6 +2116,8 @@ const tools = [
           address: { required: true, validated: false, pendingTool: null },
           };
           channelData.appliedSilenceMs = config.VAD_SILENCE_DURATION_MS || 1200;
+          channelData.baseSessionInstructions = sessionInstructions;
+          channelData.sessionInstructions = sessionInstructions;
           sipMap.set(channelId, channelData);
 
           const itemId = uuid().replace(/-/g, '').substring(0, 32);

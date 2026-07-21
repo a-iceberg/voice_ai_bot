@@ -1,31 +1,57 @@
-version: "3.9"
-
 services:
+  voice_rag:
+    build:
+      context: ./rag
+      dockerfile: Dockerfile
+    container_name: voice_rag
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      - TZ=Europe/Moscow
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - RAG_HOST=0.0.0.0
+      - RAG_PORT=7420
+      - QDRANT_URL=${QDRANT_URL:-https://c0dea10e-f348-40ea-bf6a-7ab8ee6b4dae.europe-west3-0.gcp.cloud.qdrant.io:6333}
+      - QDRANT_API_KEY=${QDRANT_API_KEY}
+      - QDRANT_COLLECTION=instructions
+      - DOC_DIR=/app/data/instructions
+      - VECTOR_CACHE_DIR=/app/vector_db_cache
+      - EMB_MODEL_REVISION=${EMB_MODEL_REVISION:-ab036b023d30b4d1138c4c3bfa9f0c445ab455d6}
+    volumes:
+      - ./data/instructions:/app/data/instructions:ro
+      - ./vector_db_cache:/app/vector_db_cache
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7420/health', timeout=3)",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 180s
+
   voice_ai_bot:
     build: .
     container_name: voice_ai_bot
     restart: always
-    # чтобы Asterisk и RTP продолжали работать как сейчас
     network_mode: host
-
+    depends_on:
+      voice_rag:
+        condition: service_healthy
     environment:
       - NODE_ENV=production
       - TZ=Europe/Moscow
-
+      - RAG_ENABLED=${RAG_ENABLED:-true}
+      - RAG_URL=${RAG_URL:-http://127.0.0.1:7420}
+      - RAG_TIMEOUT_MS=${RAG_TIMEOUT_MS:-5000}
     volumes:
-      # конфиг с ключами и промптом
       - ./config.conf:/usr/src/voice_ai_bot/config.conf:ro
-
-      # рабочие данные (auth.json, config.json, order_template.json)
       - ./data:/usr/src/voice_ai_bot/data
-
-      # папка для логов 
       - ./logs:/usr/src/voice_ai_bot/logs
-
-      # итоговые заявки 
       - ./order_sent:/usr/src/voice_ai_bot/order_sent
-
-      # текстовый файл с клиентами
       - ./clients_info.txt:/usr/src/voice_ai_bot/clients_info.txt
-
-
